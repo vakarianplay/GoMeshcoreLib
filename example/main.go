@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"meshcore"
+	"GoMeshcoreLib"
 )
 
 // payloadGrpTxt — тип полезной нагрузки группового текстового пакета
@@ -130,11 +130,11 @@ func minDur(a, b time.Duration) time.Duration {
 
 // splitForMesh режет текст на части не длиннее 133 БАЙТ, не разрывая руны.
 func splitForMesh(text string) []string {
-	if len(text) <= meshcore.MaxTextLen {
+	if len(text) <= GoMeshcoreLib.MaxTextLen {
 		return []string{text}
 	}
 	const reserve = 8 // "[01/02] "
-	body := meshcore.MaxTextLen - reserve
+	body := GoMeshcoreLib.MaxTextLen - reserve
 
 	runes := []rune(text)
 	var chunks []string
@@ -213,16 +213,16 @@ func shortErr(err error) string {
 // пакет, соответствующий принятому сообщению.
 type rxRing struct {
 	mu    sync.Mutex
-	items []meshcore.RxLogEntry
+	items []GoMeshcoreLib.RxLogEntry
 	max   int
 	ttl   time.Duration
 }
 
 func newRxRing(max int, ttl time.Duration) *rxRing {
-	return &rxRing{items: make([]meshcore.RxLogEntry, 0, max), max: max, ttl: ttl}
+	return &rxRing{items: make([]GoMeshcoreLib.RxLogEntry, 0, max), max: max, ttl: ttl}
 }
 
-func (r *rxRing) add(e meshcore.RxLogEntry) {
+func (r *rxRing) add(e GoMeshcoreLib.RxLogEntry) {
 	if e.Pkt == nil {
 		return
 	}
@@ -250,8 +250,8 @@ func (r *rxRing) add(e meshcore.RxLogEntry) {
 // Критерии совпадения: тип нагрузки GRP_TXT, одинаковый SNR (обе величины
 // вычисляются прошивкой как int8(snr*4) из одного и того же приёма) и
 // согласованный path_len. Ищем с конца — берём самое свежее совпадение.
-func (r *rxRing) find(m *meshcore.ChannelMessage) (meshcore.RxLogEntry, bool) {
-	var none meshcore.RxLogEntry
+func (r *rxRing) find(m *GoMeshcoreLib.ChannelMessage) (GoMeshcoreLib.RxLogEntry, bool) {
+	var none GoMeshcoreLib.RxLogEntry
 	if m == nil {
 		return none, false
 	}
@@ -300,7 +300,7 @@ func snrCode(snr float64) int {
 // pathMatches сверяет байт path_len из кадра сообщения с маршрутом сырого пакета.
 // В кадре direct представлен маркером 0xFF, а в самом пакете — реальным
 // path_len при direct-типе маршрута, поэтому сравниваем по типу маршрута.
-func pathMatches(p meshcore.PathInfo, pkt *meshcore.RawPacket) bool {
+func pathMatches(p GoMeshcoreLib.PathInfo, pkt *GoMeshcoreLib.RawPacket) bool {
 	if !p.Flood {
 		return !pkt.IsFlood()
 	}
@@ -308,7 +308,7 @@ func pathMatches(p meshcore.PathInfo, pkt *meshcore.RawPacket) bool {
 }
 
 // routeText формирует человекочитаемый маршрут.
-func routeText(p meshcore.PathInfo) string {
+func routeText(p GoMeshcoreLib.PathInfo) string {
 	if len(p.Hops) == 0 {
 		if p.Flood {
 			return "flood (без хопов)"
@@ -340,7 +340,7 @@ var fieldOrder = []struct {
 	{"concentration", "ppm", "", 0},
 }
 
-func formatTelemetry(name string, t *meshcore.Telemetry) string {
+func formatTelemetry(name string, t *GoMeshcoreLib.Telemetry) string {
 	used := make(map[int]bool, len(t.LPP.Fields))
 	var parts []string
 
@@ -404,14 +404,14 @@ func failText(name string, err error) string {
 
 type resolvedRep struct {
 	requested string
-	contact   *meshcore.Contact
+	contact   *GoMeshcoreLib.Contact
 	ok        bool
 }
 
 type session struct {
 	cfg      botConfig
-	client   *meshcore.Client
-	ch       meshcore.Channel
+	client   *GoMeshcoreLib.Client
+	ch       GoMeshcoreLib.Channel
 	selfName string
 	rx       *rxRing
 
@@ -431,19 +431,19 @@ type session struct {
 
 func newSession(ctx context.Context, cfg botConfig) (*session, error) {
 	var (
-		tr  meshcore.Transport
+		tr  GoMeshcoreLib.Transport
 		err error
 	)
 	if cfg.serialPort != "" {
-		tr, err = meshcore.DialSerial(cfg.serialPort, cfg.baud)
+		tr, err = GoMeshcoreLib.DialSerial(cfg.serialPort, cfg.baud)
 	} else {
-		tr, err = meshcore.DialTCP(cfg.host, cfg.port)
+		tr, err = GoMeshcoreLib.DialTCP(cfg.host, cfg.port)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	mcCfg := meshcore.DefaultConfig()
+	mcCfg := GoMeshcoreLib.DefaultConfig()
 	mcCfg.DirectAttempts = cfg.direct
 	mcCfg.FloodAttempts = cfg.flood
 	mcCfg.ChannelAttempts = cfg.chanAtt
@@ -457,7 +457,7 @@ func newSession(ctx context.Context, cfg botConfig) (*session, error) {
 		}
 	}
 
-	client, err := meshcore.Dial(tr, mcCfg)
+	client, err := GoMeshcoreLib.Dial(tr, mcCfg)
 	if err != nil {
 		_ = tr.Close()
 		return nil, err
@@ -490,11 +490,11 @@ func newSession(ctx context.Context, cfg botConfig) (*session, error) {
 		if err := client.SetFloodScope(ctx, cfg.scope); err != nil {
 			logf("ВНИМАНИЕ: не удалось задать регион %q: %v", cfg.scope, err)
 		} else {
-			logf("регион сессии: #%s", meshcore.NormalizeHashtag(cfg.scope))
+			logf("регион сессии: #%s", GoMeshcoreLib.NormalizeHashtag(cfg.scope))
 		}
 	} else if cfg.scope != "" {
 		logf("регион #%s будет задаваться вокруг каждой отправки",
-			meshcore.NormalizeHashtag(cfg.scope))
+			GoMeshcoreLib.NormalizeHashtag(cfg.scope))
 	}
 
 	reps := s.resolveTargets(ctx)
@@ -581,7 +581,7 @@ func (s *session) post(ctx context.Context, text string) {
 	}
 
 	for _, part := range splitForMesh(text) {
-		res, err := s.client.SendChannelMessage(ctx, s.ch, part, meshcore.ChannelOptions{
+		res, err := s.client.SendChannelMessage(ctx, s.ch, part, GoMeshcoreLib.ChannelOptions{
 			Scope:      scope,
 			EchoWindow: s.cfg.echoWin,
 			Attempts:   s.cfg.chanAtt,
@@ -615,7 +615,7 @@ func (s *session) post(ctx context.Context, text string) {
 // SNR и число хопов есть в самом кадре сообщения. RSSI и хэши хопов берутся
 // из rx_log (push 0x88) — единственного источника этих данных; если
 // сопоставить сырой пакет не удалось, отвечаем по данным кадра.
-func (s *session) handlePing(ctx context.Context, m *meshcore.ChannelMessage, sender string) {
+func (s *session) handlePing(ctx context.Context, m *GoMeshcoreLib.ChannelMessage, sender string) {
 	defer s.busyPing.Store(false)
 	s.noteDropped()
 
@@ -627,7 +627,7 @@ func (s *session) handlePing(ctx context.Context, m *meshcore.ChannelMessage, se
 		snr   float64
 		rssi  float64
 		hasRS bool
-		pkt   *meshcore.RawPacket
+		pkt   *GoMeshcoreLib.RawPacket
 	)
 
 	if corr {
@@ -725,7 +725,7 @@ func (s *session) handleReps(ctx context.Context) {
 // Приём сообщений
 // ---------------------------------------------------------------------------
 
-func (s *session) handleChannelMessage(ctx context.Context, m *meshcore.ChannelMessage) {
+func (s *session) handleChannelMessage(ctx context.Context, m *GoMeshcoreLib.ChannelMessage) {
 	sender, body := splitSender(m.Text)
 
 	// Не отвечаем сами себе: это наш ответ или его эхо от ретранслятора.
@@ -768,9 +768,9 @@ func (s *session) run(ctx context.Context) error {
 	// rx_log — поток ВСЕХ принятых пакетов, поэтому буфер берём большой:
 	// при переполнении события теряются и !ping теряет RSSI с маршрутом.
 	sub := s.client.SubscribeBuffered(4096,
-		meshcore.EventChannelMessage,
-		meshcore.EventDirectMessage,
-		meshcore.EventRxLog,
+		GoMeshcoreLib.EventChannelMessage,
+		GoMeshcoreLib.EventDirectMessage,
+		GoMeshcoreLib.EventRxLog,
 	)
 	defer sub.Cancel()
 
@@ -784,21 +784,21 @@ func (s *session) run(ctx context.Context) error {
 
 		case ev, ok := <-sub.Events():
 			if !ok {
-				return meshcore.ErrClosed
+				return GoMeshcoreLib.ErrClosed
 			}
 
 			switch ev.Kind {
-			case meshcore.EventRxLog:
+			case GoMeshcoreLib.EventRxLog:
 				if ev.RxLog != nil {
 					s.rx.add(*ev.RxLog)
 				}
 
-			case meshcore.EventDirectMessage:
+			case GoMeshcoreLib.EventDirectMessage:
 				if ev.Direct != nil {
 					logf("[DM] %s: %s", ev.Direct.FromName, ev.Direct.Text)
 				}
 
-			case meshcore.EventChannelMessage:
+			case GoMeshcoreLib.EventChannelMessage:
 				if ev.Channel == nil || ev.Channel.ChannelIndex != s.ch.Index {
 					continue
 				}
