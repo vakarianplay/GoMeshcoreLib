@@ -1,4 +1,4 @@
-module meshcore
+module GoMeshcoreLib
 
 go 1.21
 
