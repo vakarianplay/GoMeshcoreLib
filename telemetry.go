@@ -1,4 +1,4 @@
-package meshcore
+package GoMeshcoreLib
 
 import (
 	"bytes"
@@ -7,12 +7,12 @@ import (
 	"errors"
 )
 
-// RequestTelemetry запрашивает телеметрию узла по имени, применяя ту же
-// политику повторов, что и для личных сообщений: cfg.DirectAttempts попыток
-// по известному маршруту, затем cfg.FloodAttempts широковещательно.
+// RequestTelemetry asks a node for telemetry by name, using the same retry
+// policy as direct messages: DirectAttempts over the known path, then
+// FloodAttempts over flood.
 //
-// Логин и пароль не требуются: обработчик onContactRequest() проверяет только
-// telemetry_mode_base/loc/env узла и флаги контакта.
+// No login is needed: onContactRequest only checks the node telemetry modes
+// and the contact flags.
 func (c *Client) RequestTelemetry(ctx context.Context, name string) (*Telemetry, error) {
 	ct, err := c.ResolveContact(ctx, name)
 	if err != nil {
@@ -21,85 +21,76 @@ func (c *Client) RequestTelemetry(ctx context.Context, name string) (*Telemetry,
 	return c.RequestTelemetryFrom(ctx, ct)
 }
 
-// RequestTelemetryFrom — то же для уже найденного контакта.
+// RequestTelemetryFrom is RequestTelemetry for an already resolved contact.
 func (c *Client) RequestTelemetryFrom(ctx context.Context, ct *Contact) (*Telemetry, error) {
-	direct, flood := c.cfg.DirectAttempts, c.cfg.FloodAttempts
-	total := direct + flood
+	total := c.cfg.DirectAttempts + c.cfg.FloodAttempts
 	prefix := ct.Prefix()
 	flooded := false
-	attempt := 0
 	var lastErr error
 
 	for i := 0; i < total; i++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if !flooded && i == direct && flood > 0 {
+		if !flooded && i == c.cfg.DirectAttempts && c.cfg.FloodAttempts > 0 {
 			if err := c.ResetPath(ctx, ct); err != nil {
-				c.cfg.Logf("meshcore: сброс маршрута: %v", err)
+				c.cfg.Logf("meshcore: path reset failed: %v", err)
 			}
 			flooded = true
-			c.cfg.Logf("meshcore: телеметрия, переход на flood после %d попыток", direct)
+			c.cfg.Logf("meshcore: telemetry switching to flood after %d tries",
+				c.cfg.DirectAttempts)
 		}
-		attempt = i + 1
 
-		// Кадр 0x8B не содержит tag (прошивка его вырезает), поэтому
-		// сопоставляем по 6-байтному префиксу публичного ключа.
+		// The 0x8B frame carries no tag (the firmware strips it), so match on
+		// the 6 byte public key prefix instead.
 		push := c.arm(func(f []byte) bool {
-			return len(f) >= 8 && f[0] == pushTelemetry && bytes.Equal(f[2:8], prefix)
+			return len(f) >= telemetryMinLen && f[0] == pushTelemetry &&
+				bytes.Equal(f[telemetryKeyIdx:telemetryKeyIdx+pubKeyPrefixLen], prefix)
 		})
 
-		payload := make([]byte, 0, 36)
-		payload = append(payload, cmdSendTelemetry, 0, 0, 0)
-		payload = append(payload, ct.PublicKey[:]...)
-
+		payload := frame(cmdSendTelemetry, zeros(telemReqReservedLen), ct.PublicKey[:])
 		sent, err := c.tx([]byte{respSent, respErr}, payload, c.cfg.CommandTimeout)
-		if err != nil {
+		if err != nil || (len(sent) > 0 && sent[0] == respErr) {
 			push.release()
+			if err == nil {
+				err = frameError(sent)
+			}
 			lastErr = err
-			c.cfg.Logf("meshcore: телеметрия, попытка %d: %v", attempt, err)
-			c.sleep(c.cfg.RetryDelay)
-			continue
-		}
-		if sent[0] == respErr {
-			push.release()
-			lastErr = frameError(sent)
-			if errors.Is(lastErr, ErrNotFound) {
-				return nil, lastErr
+			c.cfg.Logf("meshcore: telemetry attempt %d failed: %v", i+1, err)
+			if errors.Is(err, ErrNotFound) {
+				return nil, err
 			}
 			c.sleep(c.cfg.RetryDelay)
 			continue
 		}
-		if len(sent) < 10 {
+		if len(sent) < sentFrameLen {
 			push.release()
-			lastErr = errors.New("meshcore: короткий кадр SENT")
+			lastErr = errors.New("meshcore: short SENT frame")
 			c.sleep(c.cfg.RetryDelay)
 			continue
 		}
 
-		route := "direct"
-		if sent[1] == 1 {
+		route, _ := "direct", false
+		if sent[sentRouteIdx] == sentRouteFlood {
 			route = "flood"
 		}
-		est := binary.LittleEndian.Uint32(sent[6:10])
-		wait := c.clampWait(est)
-		c.cfg.Logf("meshcore: телеметрия, попытка %d (%s), жду %s", attempt, route, wait)
+		wait := c.clampWait(binary.LittleEndian.Uint32(sent[sentTimeoutIdx : sentTimeoutIdx+4]))
+		c.cfg.Logf("meshcore: telemetry attempt %d (%s), waiting %s", i+1, route, wait)
 
 		f, err := push.wait(wait)
-		if err == nil {
-			t, ok := parseTelemetryPush(f)
-			if !ok {
-				lastErr = errors.New("meshcore: не удалось разобрать кадр телеметрии")
-				c.sleep(c.cfg.RetryDelay)
-				continue
-			}
-			t.Attempts = attempt
-			t.Route = route
-			t.FromName = ct.Name
-			return t, nil
+		if err != nil {
+			lastErr = err
+			c.sleep(c.cfg.RetryDelay)
+			continue
 		}
-		lastErr = err
-		c.sleep(c.cfg.RetryDelay)
+		t, ok := parseTelemetryPush(f)
+		if !ok {
+			lastErr = errors.New("meshcore: cannot parse telemetry frame")
+			c.sleep(c.cfg.RetryDelay)
+			continue
+		}
+		t.Attempts, t.Route, t.FromName = i+1, route, ct.Name
+		return t, nil
 	}
 
 	if lastErr == nil {
@@ -108,16 +99,16 @@ func (c *Client) RequestTelemetryFrom(ctx context.Context, ct *Contact) (*Teleme
 	return nil, lastErr
 }
 
-// RequestSelfTelemetry запрашивает телеметрию самого компаньона.
-// Формат запроса — ровно 4 байта без публичного ключа; прошивка отвечает
-// кадром 0x8B немедленно, без выхода в эфир.
+// RequestSelfTelemetry asks the companion for its own telemetry. The request is
+// exactly 4 bytes with no public key, and the firmware answers immediately
+// without using the radio.
 func (c *Client) RequestSelfTelemetry(ctx context.Context) (*Telemetry, error) {
 	push := c.arm(func(f []byte) bool {
-		return len(f) >= 8 && f[0] == pushTelemetry
+		return len(f) >= telemetryMinLen && f[0] == pushTelemetry
 	})
 	defer push.release()
 
-	if err := c.send([]byte{cmdSendTelemetry, 0, 0, 0}); err != nil {
+	if err := c.send(frame(cmdSendTelemetry, zeros(telemReqReservedLen))); err != nil {
 		return nil, err
 	}
 	f, err := push.wait(c.cfg.CommandTimeout)
@@ -126,36 +117,32 @@ func (c *Client) RequestSelfTelemetry(ctx context.Context) (*Telemetry, error) {
 	}
 	t, ok := parseTelemetryPush(f)
 	if !ok {
-		return nil, errors.New("meshcore: не удалось разобрать кадр телеметрии")
+		return nil, errors.New("meshcore: cannot parse telemetry frame")
 	}
-	t.Attempts = 1
-	t.Route = "self"
-	t.FromName = c.Self().Name
+	t.Attempts, t.Route, t.FromName = 1, "self", c.Self().Name
 	return t, nil
 }
 
-// BatteryStorage — напряжение батареи и занятость хранилища компаньона.
+// BatteryStorage is the companion battery and storage report.
 type BatteryStorage struct {
 	Millivolts uint16
 	UsedKB     uint32
 	TotalKB    uint32
 }
 
-// Battery возвращает состояние батареи и хранилища собственного узла.
+// Battery returns the local node battery voltage and storage usage.
 func (c *Client) Battery(ctx context.Context) (BatteryStorage, error) {
 	var b BatteryStorage
-	f, err := c.tx([]byte{respBattStorage, respErr}, []byte{cmdGetBattStorage}, c.cfg.CommandTimeout)
+	f, err := c.txOne(respBattStorage, []byte{cmdGetBattStorage})
 	if err != nil {
 		return b, err
 	}
-	if f[0] == respErr {
-		return b, frameError(f)
+	if len(f) < batteryFrameLen {
+		return b, errors.New("meshcore: short BATTERY frame")
 	}
-	if len(f) < 11 {
-		return b, errors.New("meshcore: короткий кадр BATTERY")
-	}
-	b.Millivolts = binary.LittleEndian.Uint16(f[1:3])
-	b.UsedKB = binary.LittleEndian.Uint32(f[3:7])
-	b.TotalKB = binary.LittleEndian.Uint32(f[7:11])
+	r := newReader(f[1:])
+	b.Millivolts = r.u16()
+	b.UsedKB = r.u32()
+	b.TotalKB = r.u32()
 	return b, nil
 }
