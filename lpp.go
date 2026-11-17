@@ -1,18 +1,18 @@
-package meshcore
+package GoMeshcoreLib
 
 import (
 	"encoding/hex"
 	"fmt"
 )
 
-// HumidityFieldSize — размер поля относительной влажности в LPP.
-// В исходниках MeshCore разнобой: LPPData::getDataSize() даёт 2 байта,
-// а LPPReader::readRelativeHumidity() читает 1 байт с шагом 0.5 %.
-// Кодировщик CayenneLPP пишет 1 байт, поэтому по умолчанию 1.
-// Меняйте на 2, если влажность вдвое завышена, а остальные поля съехали.
-var HumidityFieldSize = 1
+// HumidityFieldSize is the byte width of the relative humidity field.
+// The firmware disagrees with itself: LPPData::getDataSize() says 2 while
+// LPPReader::readRelativeHumidity() reads 1 byte at 0.5 % steps, and the
+// CayenneLPP encoder writes 1. Set to 2 if humidity reads double and the
+// following fields look shifted.
+var HumidityFieldSize = lppDefaultHumiditySize
 
-// LPPField — одно значение телеметрии.
+// LPPField is one telemetry value.
 type LPPField struct {
 	Channel int     `json:"channel"`
 	Type    int     `json:"type"`
@@ -21,14 +21,14 @@ type LPPField struct {
 	Value   float64 `json:"value"`
 }
 
-// LPPResult — результат разбора Cayenne LPP.
+// LPPResult is a decoded Cayenne LPP buffer.
 type LPPResult struct {
 	Fields []LPPField `json:"fields"`
 	Raw    string     `json:"raw_hex"`
 	Tail   string     `json:"unparsed_hex,omitempty"`
 }
 
-// Get возвращает первое поле с указанным именем.
+// Get returns the first field with the given name.
 func (r LPPResult) Get(name string) (float64, bool) {
 	for _, f := range r.Fields {
 		if f.Name == name {
@@ -38,8 +38,64 @@ func (r LPPResult) Get(name string) (float64, bool) {
 	return 0, false
 }
 
-// beFloat: значения LPP лежат big-endian.
-func beFloat(b []byte, mult float64, signed bool) float64 {
+type lppSpec struct {
+	name   string
+	unit   string
+	size   int
+	div    float64
+	signed bool
+}
+
+var lppSpecs = map[byte]lppSpec{
+	lppDigitalInput:  {"digital_input", "", lppSize1, lppDiv1, false},
+	lppDigitalOutput: {"digital_output", "", lppSize1, lppDiv1, false},
+	lppAnalogInput:   {"analog_input", "", lppSize2, lppDiv100, true},
+	lppAnalogOutput:  {"analog_output", "", lppSize2, lppDiv100, true},
+	lppGeneric:       {"generic_sensor", "", lppSize4, lppDiv1, false},
+	lppLuminosity:    {"luminosity", "lx", lppSize2, lppDiv1, false},
+	lppPresence:      {"presence", "", lppSize1, lppDiv1, false},
+	lppTemperature:   {"temperature", "°C", lppSize2, lppDiv10, true},
+	lppRelHumidity:   {"relative_humidity", "%", lppSize1, lppDiv2, false},
+	lppAccelerometer: {"accelerometer", "G", lppSize6, lppAxisDiv, true},
+	lppPressure:      {"pressure", "hPa", lppSize2, lppDiv10, false},
+	lppVoltage:       {"voltage", "V", lppSize2, lppDiv100, false},
+	lppCurrent:       {"current", "A", lppSize2, lppDiv1000, true},
+	lppFrequency:     {"frequency", "Hz", lppSize4, lppDiv1, false},
+	lppPercentage:    {"percentage", "%", lppSize1, lppDiv1, false},
+	lppAltitude:      {"altitude", "m", lppSize2, lppDiv1, true},
+	lppConcentration: {"concentration", "ppm", lppSize2, lppDiv1, false},
+	lppPower:         {"power", "W", lppSize2, lppDiv1, false},
+	lppDistance:      {"distance", "m", lppSize4, lppDiv1000, false},
+	lppEnergy:        {"energy", "kWh", lppSize4, lppDiv1000, false},
+	lppDirection:     {"direction", "°", lppSize2, lppDiv1, false},
+	lppUnixTime:      {"unixtime", "s", lppSize4, lppDiv1, false},
+	lppGyrometer:     {"gyrometer", "°/s", lppSize6, lppGyroDiv, true},
+	lppColour:        {"colour", "RGB", lppSize3, lppDiv1, false},
+	lppGPS:           {"gps", "°", lppSize9, lppDiv1, true},
+	lppSwitch:        {"switch", "", lppSize1, lppDiv1, false},
+}
+
+// dataSize reports the value width of an LPP type. ok is false for unknown
+// types: parsing then stops and the remainder lands in Tail, which is safer
+// than LPPData::getDataSize() returning 1 and silently corrupting the rest.
+func dataSize(t byte) (int, bool) {
+	if t == lppRelHumidity {
+		return HumidityFieldSize, true
+	}
+	s, ok := lppSpecs[t]
+	return s.size, ok
+}
+
+func typeName(t byte) (string, string) {
+	s, ok := lppSpecs[t]
+	if !ok {
+		return fmt.Sprintf(lppNameUnknown, t), ""
+	}
+	return s.name, s.unit
+}
+
+// beFloat decodes a big-endian LPP value.
+func beFloat(b []byte, div float64, signed bool) float64 {
 	var v uint32
 	for _, x := range b {
 		v = (v << 8) + uint32(x)
@@ -52,131 +108,30 @@ func beFloat(b []byte, mult float64, signed bool) float64 {
 			sign = -1
 		}
 	}
-	return sign * float64(v) / mult
-}
-
-// dataSize — длина поля значения. Для неизвестного типа ok=false: парсинг
-// останавливается, а остаток попадает в Tail. Это честнее, чем поведение
-// LPPData::getDataSize(), который для неизвестного типа возвращает 1 и
-// молча ломает весь последующий разбор.
-func dataSize(t byte) (int, bool) {
-	switch t {
-	case 0, 1, 102, 120, 142: // digital in/out, presence, percentage, switch
-		return 1, true
-	case 104: // relative humidity — см. HumidityFieldSize
-		return HumidityFieldSize, true
-	case 2, 3, 101, 103, 115, 116, 117, 121, 125, 128, 132:
-		return 2, true
-	case 135: // colour RGB
-		return 3, true
-	case 100, 118, 130, 131, 133:
-		return 4, true
-	case 113, 134: // accelerometer / gyrometer: 3 оси по 2 байта
-		return 6, true
-	case 136: // GPS: lat(3) lon(3) alt(3)
-		return 9, true
-	}
-	return 0, false
-}
-
-func typeName(t byte) (string, string) {
-	switch t {
-	case 0:
-		return "digital_input", ""
-	case 1:
-		return "digital_output", ""
-	case 2:
-		return "analog_input", ""
-	case 3:
-		return "analog_output", ""
-	case 100:
-		return "generic_sensor", ""
-	case 101:
-		return "luminosity", "lx"
-	case 102:
-		return "presence", ""
-	case 103:
-		return "temperature", "°C"
-	case 104:
-		return "relative_humidity", "%"
-	case 113:
-		return "accelerometer", "G"
-	case 115:
-		return "pressure", "hPa"
-	case 116:
-		return "voltage", "V"
-	case 117:
-		return "current", "A"
-	case 118:
-		return "frequency", "Hz"
-	case 120:
-		return "percentage", "%"
-	case 121:
-		return "altitude", "m"
-	case 125:
-		return "concentration", "ppm"
-	case 128:
-		return "power", "W"
-	case 130:
-		return "distance", "m"
-	case 131:
-		return "energy", "kWh"
-	case 132:
-		return "direction", "°"
-	case 133:
-		return "unixtime", "s"
-	case 134:
-		return "gyrometer", "°/s"
-	case 135:
-		return "colour", "RGB"
-	case 136:
-		return "gps", "°"
-	case 142:
-		return "switch", ""
-	}
-	return fmt.Sprintf("unknown_%d", t), ""
+	return sign * float64(v) / div
 }
 
 func decodeScalar(b []byte, t byte) float64 {
-	switch t {
-	case 103: // temperature: 0.1 °C, signed
-		return beFloat(b, 10, true)
-	case 104: // relative humidity: 0.5 %, unsigned
-		return beFloat(b, 2, false)
-	case 115: // pressure: 0.1 hPa, unsigned
-		return beFloat(b, 10, false)
-	case 116: // voltage: 0.01 V, unsigned
-		return beFloat(b, 100, false)
-	case 117: // current: 0.001 A, signed
-		return beFloat(b, 1000, true)
-	case 2, 3: // analog in/out: 0.01, signed
-		return beFloat(b, 100, true)
-	case 121: // altitude: 1 m, signed
-		return beFloat(b, 1, true)
-	case 130, 131: // distance / energy: 0.001, unsigned
-		return beFloat(b, 1000, false)
-	default:
-		// luminosity, percentage, power, frequency, direction,
-		// concentration, generic_sensor, unixtime, digital, presence, switch
-		return beFloat(b, 1, false)
-	}
+	s := lppSpecs[t]
+	return beFloat(b, s.div, s.signed)
 }
 
-// DecodeLPP разбирает буфер Cayenne LPP. Канал 0 — маркер конца данных.
+// DecodeLPP decodes a Cayenne LPP buffer. Channel 0 marks the end of data.
 func DecodeLPP(buf []byte) LPPResult {
 	res := LPPResult{Raw: hex.EncodeToString(buf)}
 	pos := 0
+
 	add := func(ch int, t byte, name, unit string, v float64) {
 		res.Fields = append(res.Fields, LPPField{ch, int(t), name, unit, v})
 	}
-	truncated := func() LPPResult {
-		res.Tail = hex.EncodeToString(buf[pos:])
+	// Rewind past the header so it is included in the unparsed remainder.
+	truncated := func(rewind int) LPPResult {
+		res.Tail = hex.EncodeToString(buf[max(pos-rewind, 0):])
 		return res
 	}
 
 	for pos+2 <= len(buf) {
-		ch := buf[pos]
-		typ := buf[pos+1]
+		ch, typ := int(buf[pos]), buf[pos+1]
 		pos += 2
 		if ch == 0 {
 			break
@@ -184,42 +139,44 @@ func DecodeLPP(buf []byte) LPPResult {
 		name, unit := typeName(typ)
 
 		switch typ {
-		case 136: // GPS
-			if pos+9 > len(buf) {
-				return truncated()
+		case lppGPS:
+			if pos+lppSize9 > len(buf) {
+				return truncated(2)
 			}
-			add(int(ch), typ, name+".lat", "°", beFloat(buf[pos:pos+3], 10000, true))
-			add(int(ch), typ, name+".lon", "°", beFloat(buf[pos+3:pos+6], 10000, true))
-			add(int(ch), typ, name+".alt", "m", beFloat(buf[pos+6:pos+9], 100, true))
-			pos += 9
-		case 113, 134: // accelerometer / gyrometer
-			mult := 1000.0
-			if typ == 134 {
-				mult = 100
+			add(ch, typ, name+lppSuffixLat, "°", beFloat(buf[pos:pos+lppCoordLen], lppCoordDiv, true))
+			add(ch, typ, name+lppSuffixLon, "°", beFloat(buf[pos+lppCoordLen:pos+6], lppCoordDiv, true))
+			add(ch, typ, name+lppSuffixAlt, "m", beFloat(buf[pos+6:pos+9], lppAltDiv, true))
+			pos += lppSize9
+
+		case lppAccelerometer, lppGyrometer:
+			if pos+lppSize6 > len(buf) {
+				return truncated(2)
 			}
-			if pos+6 > len(buf) {
-				return truncated()
+			div := lppAxisDiv
+			if typ == lppGyrometer {
+				div = lppGyroDiv
 			}
-			for i, ax := range []string{"x", "y", "z"} {
-				add(int(ch), typ, name+"."+ax, unit,
-					beFloat(buf[pos+i*2:pos+i*2+2], mult, true))
+			for i, suffix := range []string{lppSuffixX, lppSuffixY, lppSuffixZ} {
+				off := pos + i*lppAxisLen
+				add(ch, typ, name+suffix, unit, beFloat(buf[off:off+lppAxisLen], div, true))
 			}
-			pos += 6
-		case 135: // colour RGB
-			if pos+3 > len(buf) {
-				return truncated()
+			pos += lppSize6
+
+		case lppColour:
+			if pos+lppSize3 > len(buf) {
+				return truncated(2)
 			}
-			add(int(ch), typ, name+".r", "", float64(buf[pos]))
-			add(int(ch), typ, name+".g", "", float64(buf[pos+1]))
-			add(int(ch), typ, name+".b", "", float64(buf[pos+2]))
-			pos += 3
+			for i, suffix := range []string{lppSuffixR, lppSuffixG, lppSuffixB} {
+				add(ch, typ, name+suffix, "", float64(buf[pos+i]))
+			}
+			pos += lppSize3
+
 		default:
-			n, ok := dataSize(typ)
-			if !ok || pos+n > len(buf) {
-				pos -= 2 // откат на заголовок, чтобы он попал в Tail
-				return truncated()
+			n, known := dataSize(typ)
+			if !known || pos+n > len(buf) {
+				return truncated(2)
 			}
-			add(int(ch), typ, name, unit, decodeScalar(buf[pos:pos+n], typ))
+			add(ch, typ, name, unit, decodeScalar(buf[pos:pos+n], typ))
 			pos += n
 		}
 	}

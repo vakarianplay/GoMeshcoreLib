@@ -1,4 +1,4 @@
-package meshcore
+package GoMeshcoreLib
 
 import (
 	"context"

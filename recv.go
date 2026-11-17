@@ -1,11 +1,8 @@
-package meshcore
+package GoMeshcoreLib
 
-import (
-	"encoding/binary"
-	"time"
-)
+import "time"
 
-// SelfInfo — ответ на CMD_APP_START (RESP_CODE_SELF_INFO).
+// SelfInfo is the APP_START reply.
 type SelfInfo struct {
 	AdvType           byte
 	TXPowerDBm        int8
@@ -26,7 +23,7 @@ type SelfInfo struct {
 	Name              string
 }
 
-// DeviceInfo — ответ на CMD_DEVICE_QUERY (RESP_CODE_DEVICE_INFO).
+// DeviceInfo is the DEVICE_QUERY reply.
 type DeviceInfo struct {
 	FirmwareVerCode byte
 	MaxContacts     int
@@ -41,41 +38,31 @@ type DeviceInfo struct {
 
 func parseSelfInfo(f []byte) (SelfInfo, bool) {
 	var s SelfInfo
-	// Минимум без имени: 1+3+32+8+4+10 = 58
-	if len(f) < 58 || f[0] != respSelfInfo {
+	if len(f) < selfInfoMinLen || f[0] != respSelfInfo {
 		return s, false
 	}
-	i := 1
-	s.AdvType = f[i]
-	s.TXPowerDBm = int8(f[i+1])
-	s.MaxTXPowerDBm = int8(f[i+2])
-	i += 3
-	copy(s.PublicKey[:], f[i:i+32])
-	i += 32
-	lat := int32(binary.LittleEndian.Uint32(f[i:]))
-	lon := int32(binary.LittleEndian.Uint32(f[i+4:]))
-	s.Lat = float64(lat) / 1e6
-	s.Lon = float64(lon) / 1e6
-	i += 8
-	s.MultiAcks = f[i]
-	s.AdvertLocPolicy = f[i+1]
-	tm := f[i+2]
-	s.TelemetryModeEnv = (tm >> 4) & 0x03
-	s.TelemetryModeLoc = (tm >> 2) & 0x03
-	s.TelemetryModeBase = tm & 0x03
-	s.ManualAddContacts = f[i+3] > 0
-	i += 4
-	freq := binary.LittleEndian.Uint32(f[i:])
-	bw := binary.LittleEndian.Uint32(f[i+4:])
-	s.FreqMHz = float64(freq) / 1000.0
-	s.BandwidthKHz = float64(bw) / 1000.0
-	s.SpreadingFactor = int(f[i+8])
-	s.CodingRate = int(f[i+9])
-	i += 10
-	if i < len(f) {
-		s.Name = trimNUL(string(f[i:]))
-	}
-	return s, true
+	r := newReader(f[1:])
+	s.AdvType = r.u8()
+	s.TXPowerDBm = r.i8()
+	s.MaxTXPowerDBm = r.i8()
+	copy(s.PublicKey[:], r.take(pubKeyLen))
+	s.Lat = float64(r.i32()) / latLonScale
+	s.Lon = float64(r.i32()) / latLonScale
+	s.MultiAcks = r.u8()
+	s.AdvertLocPolicy = r.u8()
+
+	modes := r.u8()
+	s.TelemetryModeEnv = (modes >> 4) & 0x03
+	s.TelemetryModeLoc = (modes >> 2) & 0x03
+	s.TelemetryModeBase = modes & 0x03
+	s.ManualAddContacts = r.u8() > 0
+
+	s.FreqMHz = float64(r.u32()) / radioFreqScale
+	s.BandwidthKHz = float64(r.u32()) / radioFreqScale
+	s.SpreadingFactor = int(r.u8())
+	s.CodingRate = int(r.u8())
+	s.Name = string(r.rest())
+	return s, r.ok
 }
 
 func parseDeviceInfo(f []byte) (DeviceInfo, bool) {
@@ -84,43 +71,26 @@ func parseDeviceInfo(f []byte) (DeviceInfo, bool) {
 		return d, false
 	}
 	d.FirmwareVerCode = f[1]
-	if d.FirmwareVerCode < 3 || len(f) < 80 {
+	if d.FirmwareVerCode < deviceInfoMinVer || len(f) < deviceInfoMinLen {
 		return d, true
 	}
-	d.MaxContacts = int(f[2]) * 2
-	d.MaxChannels = int(f[3])
-	d.BLEPin = binary.LittleEndian.Uint32(f[4:8])
-	d.FirmwareBuild = trimNUL(string(f[8:20]))
-	d.Model = trimNUL(string(f[20:60]))
-	d.Version = trimNUL(string(f[60:80]))
-	if len(f) > 80 {
-		d.ClientRepeat = f[80]
-	}
-	if len(f) > 81 {
-		d.PathHashMode = f[81]
-	}
+	r := newReader(f[2:])
+	d.MaxContacts = int(r.u8()) * 2
+	d.MaxChannels = int(r.u8())
+	d.BLEPin = r.u32()
+	d.FirmwareBuild = r.string(deviceInfoFirmwLen)
+	d.Model = r.string(deviceInfoModelLen)
+	d.Version = r.string(deviceInfoVerLen)
+	d.ClientRepeat = r.u8()
+	d.PathHashMode = r.u8()
 	return d, true
 }
 
-func trimNUL(s string) string {
-	for i := 0; i < len(s); i++ {
-		if s[i] == 0 {
-			return s[:i]
-		}
-	}
-	return s
-}
-
-// ---------------------------------------------------------------------------
-// Входящие личные сообщения
-// ---------------------------------------------------------------------------
-
-// DirectMessage — личное сообщение от контакта.
+// DirectMessage is a direct message from a contact.
 //
-// ВАЖНО: кадр companion-протокола несёт SNR и байт path_len, но НЕ несёт сами
-// хэши хопов и не несёт RSSI. Полный маршрут в хэшах и RSSI доступны только из
-// сырых пакетов rx_log (см. RxLogEntry). Реальный маршрут, по которому пришёл
-// последний advert контакта, даёт ContactAdvertPath().
+// The frame carries SNR and the path_len byte only: no hop hashes and no RSSI.
+// Those come from rx_log (see RxLogEntry); the route of a contact's latest
+// advert is available through ContactAdvertPath.
 type DirectMessage struct {
 	From         [6]byte
 	FromName     string
@@ -128,59 +98,39 @@ type DirectMessage struct {
 	SNR          float64
 	Path         PathInfo
 	TxtType      byte
-	SignerPrefix []byte // только для TxtTypeSignedPlain
+	SignerPrefix []byte
 	Time         time.Time
 	Text         string
 }
 
 func parseDirectMessage(f []byte) (*DirectMessage, bool) {
 	m := &DirectMessage{}
-	i := 1
-	if f[0] == respContactMsgV3 {
-		// snr(1) + res(2) + key(6) + path(1) + txt_type(1) + ts(4) = 16
-		if len(f) < 16 {
-			return nil, false
-		}
-		m.SNR = float64(int8(f[1])) / 4.0
-		m.HasSNR = true
-		i = 4 // snr + 2 зарезервированных
-	} else if len(f) < 13 { // key(6) + path(1) + txt_type(1) + ts(4) = 13
+	body, ok := messageBody(f, textPrefixLen, textPrefixV3Len)
+	if !ok {
 		return nil, false
 	}
+	m.HasSNR, m.SNR = body.hasSNR, body.snr
 
-	copy(m.From[:], f[i:i+6])
-	i += 6
-	m.Path = decodePathLenByte(f[i])
-	i++
-	m.TxtType = f[i]
-	i++
-	ts := binary.LittleEndian.Uint32(f[i:])
-	i += 4
-	m.Time = time.Unix(int64(ts), 0)
-
+	r := newReader(body.rest)
+	copy(m.From[:], r.take(pubKeyPrefixLen))
+	m.Path = decodePathLenByte(r.u8())
+	m.TxtType = r.u8()
+	m.Time = unixTime(r.u32())
 	if m.TxtType == TxtTypeSignedPlain {
-		if len(f) < i+4 {
-			return nil, false
-		}
-		m.SignerPrefix = append([]byte(nil), f[i:i+4]...)
-		i += 4
+		m.SignerPrefix = append([]byte(nil), r.take(signerPrefixLen)...)
 	}
-	if i > len(f) {
+	if !r.ok {
 		return nil, false
 	}
-	m.Text = string(f[i:])
+	m.Text = string(r.rest())
 	return m, true
 }
 
-// ---------------------------------------------------------------------------
-// Входящие групповые сообщения
-// ---------------------------------------------------------------------------
-
-// ChannelMessage — сообщение из группового (хэштег) канала.
+// ChannelMessage is a message from a group (hashtag) channel.
 //
-// Поле ScopeCode заполняется только при успешной корреляции с rx_log.
-// Имя региона из transport-кода не восстанавливается: это усечённый HMAC,
-// а не идентификатор.
+// ScopeCode is only filled when the message was correlated with rx_log. A
+// region name cannot be recovered from it: the transport code is a truncated
+// HMAC, not an identifier.
 type ChannelMessage struct {
 	ChannelIndex byte
 	ChannelName  string
@@ -191,7 +141,6 @@ type ChannelMessage struct {
 	Time         time.Time
 	Text         string
 
-	// Заполняется при корреляции с rx_log:
 	HasRxLog       bool
 	RSSI           float64
 	ScopeCode      uint16
@@ -201,42 +150,54 @@ type ChannelMessage struct {
 
 func parseChannelMessage(f []byte) (*ChannelMessage, bool) {
 	m := &ChannelMessage{}
-	i := 1
-	if f[0] == respChannelMsgV3 {
-		// snr(1) + res(2) + chan(1) + path(1) + txt_type(1) + ts(4) = 11
-		if len(f) < 11 {
-			return nil, false
-		}
-		m.SNR = float64(int8(f[1])) / 4.0
-		m.HasSNR = true
-		i = 4
-	} else if len(f) < 8 { // chan(1) + path(1) + txt_type(1) + ts(4) = 8
+	body, ok := messageBody(f, chanTextPrefixLen, chanTextPrefixV3Len)
+	if !ok {
 		return nil, false
 	}
+	m.HasSNR, m.SNR = body.hasSNR, body.snr
 
-	m.ChannelIndex = f[i]
-	i++
-	m.Path = decodePathLenByte(f[i])
-	i++
-	m.TxtType = f[i]
-	i++
-	ts := binary.LittleEndian.Uint32(f[i:])
-	i += 4
-	m.Time = time.Unix(int64(ts), 0)
-	if i > len(f) {
+	r := newReader(body.rest)
+	m.ChannelIndex = r.u8()
+	m.Path = decodePathLenByte(r.u8())
+	m.TxtType = r.u8()
+	m.Time = unixTime(r.u32())
+	if !r.ok {
 		return nil, false
 	}
-	m.Text = string(f[i:])
+	m.Text = string(r.rest())
 	return m, true
 }
 
-// ---------------------------------------------------------------------------
-// rx_log: сырые пакеты с маршрутом, SNR и RSSI
-// ---------------------------------------------------------------------------
+// msgBody is the part of a message frame after the optional SNR header.
+type msgBody struct {
+	rest   []byte
+	snr    float64
+	hasSNR bool
+}
 
-// RxLogEntry — сырой принятый пакет (PUSH_CODE_LOG_RX_DATA, 0x88).
-// Единственный источник, дающий одновременно SNR, RSSI, transport-коды
-// региона и полный маршрут в хэшах.
+// messageBody splits a v2 or v3 message frame into its SNR header and the rest.
+func messageBody(f []byte, minV2, minV3 int) (msgBody, bool) {
+	var b msgBody
+	switch {
+	case len(f) == 0:
+		return b, false
+	case f[0] == respContactMsgV3 || f[0] == respChannelMsgV3:
+		if len(f) < minV3 {
+			return b, false
+		}
+		b.snr, b.hasSNR = float64(int8(f[1]))/snrScale, true
+		b.rest = f[4:] // snr + 2 reserved bytes
+	default:
+		if len(f) < minV2 {
+			return b, false
+		}
+		b.rest = f[1:]
+	}
+	return b, true
+}
+
+// RxLogEntry is a raw received packet (PUSH_CODE_LOG_RX_DATA). It is the only
+// source carrying SNR, RSSI, transport codes and the hop hashes together.
 type RxLogEntry struct {
 	At   time.Time
 	SNR  float64
@@ -245,23 +206,22 @@ type RxLogEntry struct {
 }
 
 func parseRxLog(f []byte) (*RxLogEntry, bool) {
-	if len(f) < 4 || f[0] != pushRxLog {
+	if len(f) < rxLogMinLen || f[0] != pushRxLog {
 		return nil, false
 	}
-	e := &RxLogEntry{
-		At:   time.Now(),
-		SNR:  float64(int8(f[1])) / 4.0,
-		RSSI: float64(int8(f[2])),
-	}
-	pkt, ok := parseRawPacket(f[3:])
+	pkt, ok := parseRawPacket(f[rxLogDataIdx:])
 	if !ok {
 		return nil, false
 	}
-	e.Pkt = pkt
-	return e, true
+	return &RxLogEntry{
+		At:   time.Now(),
+		SNR:  float64(int8(f[1])) / snrScale,
+		RSSI: float64(int8(f[2])),
+		Pkt:  pkt,
+	}, true
 }
 
-// Echo — факт повторения нашего пакета ретранслятором.
+// Echo records one repeater retransmission of our packet.
 type Echo struct {
 	At   time.Time
 	SNR  float64
@@ -270,11 +230,7 @@ type Echo struct {
 	Pkt  *RawPacket
 }
 
-// ---------------------------------------------------------------------------
-// Телеметрия
-// ---------------------------------------------------------------------------
-
-// Telemetry — ответ на запрос телеметрии.
+// Telemetry is a telemetry response.
 type Telemetry struct {
 	From     [6]byte
 	FromName string
@@ -285,11 +241,12 @@ type Telemetry struct {
 }
 
 func parseTelemetryPush(f []byte) (*Telemetry, bool) {
-	if len(f) < 8 || f[0] != pushTelemetry {
+	if len(f) < telemetryMinLen || f[0] != pushTelemetry {
 		return nil, false
 	}
-	t := &Telemetry{At: time.Now()}
-	copy(t.From[:], f[2:8])
-	t.LPP = DecodeLPP(f[8:])
+	t := &Telemetry{At: time.Now(), LPP: DecodeLPP(f[telemetryDataIdx:])}
+	copy(t.From[:], f[telemetryKeyIdx:telemetryKeyIdx+pubKeyPrefixLen])
 	return t, true
 }
+
+func unixTime(secs uint32) time.Time { return time.Unix(int64(secs), 0) }

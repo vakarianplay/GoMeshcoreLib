@@ -1,9 +1,8 @@
-package meshcore
+package GoMeshcoreLib
 
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"sync"
@@ -11,25 +10,23 @@ import (
 	"time"
 )
 
-// Config — параметры клиента и политики повторов.
+// Config holds client parameters and retry policies.
 type Config struct {
-	// Политика повторов для личных сообщений и запросов телеметрии.
-	DirectAttempts int // попыток по последнему известному маршруту (по умолч. 5)
-	FloodAttempts  int // затем широковещательных попыток (по умолч. 5)
+	// Retry policy for direct messages and telemetry requests.
+	DirectAttempts int // tries over the last known path
+	FloodAttempts  int // then tries over flood
 
-	// Политика повторов для групповых (хэштег) каналов.
-	ChannelAttempts int // попыток, пока пакет не повторит ретранслятор (3)
+	// Retry policy for hashtag channels.
+	ChannelAttempts int // tries until a repeater echoes the packet
 
-	RetryDelay time.Duration // пауза между попытками
-	// EchoWindow — сколько ждать эхо от ретрансляторов после отправки в канал.
-	EchoWindow time.Duration
-	// RequireRepeats — сколько эхо одного пакета считать подтверждением.
-	RequireRepeats int
+	RetryDelay     time.Duration // pause between tries
+	EchoWindow     time.Duration // how long to wait for repeater echoes
+	RequireRepeats int           // echoes of one packet counted as proof
 
-	CommandTimeout time.Duration // на короткий обмен команда/ответ
-	AckSlack       float64       // множитель к suggested_timeout (1.25)
-	MinWait        time.Duration // нижняя граница ожидания mesh-ответа
-	MaxWait        time.Duration // верхняя граница
+	CommandTimeout time.Duration // short command/response exchanges
+	AckSlack       float64       // multiplier applied to suggested_timeout
+	MinWait        time.Duration // lower bound for mesh responses
+	MaxWait        time.Duration // upper bound for mesh responses
 
 	AppName     string
 	Verbose     bool
@@ -37,24 +34,24 @@ type Config struct {
 	EventBuffer int
 }
 
-// DefaultConfig возвращает конфиг со значениями по умолчанию.
+// DefaultConfig returns a Config with the library defaults.
 func DefaultConfig() Config {
 	return Config{
-		DirectAttempts:  5,
-		FloodAttempts:   5,
-		ChannelAttempts: 3,
-		RetryDelay:      0,
-		EchoWindow:      8 * time.Second,
-		RequireRepeats:  1,
-		CommandTimeout:  15 * time.Second,
-		AckSlack:        1.25,
-		MinWait:         5 * time.Second,
-		MaxWait:         5 * time.Minute,
+		DirectAttempts:  defaultDirectAttempts,
+		FloodAttempts:   defaultFloodAttempts,
+		ChannelAttempts: defaultChannelAttempts,
+		EchoWindow:      defaultEchoWindow,
+		RequireRepeats:  defaultRequireRepeats,
+		CommandTimeout:  defaultCommandTimeout,
+		AckSlack:        defaultAckSlack,
+		MinWait:         defaultMinWait,
+		MaxWait:         defaultMaxWait,
 		AppName:         "go-meshcore",
-		EventBuffer:     256,
+		EventBuffer:     defaultEventBuffer,
 	}
 }
 
+// withDefaults fills zero fields from DefaultConfig.
 func (c Config) withDefaults() Config {
 	d := DefaultConfig()
 	if c.DirectAttempts <= 0 {
@@ -96,15 +93,15 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// Client — соединение с компаньоном MeshCore.
-// Все методы безопасны для одновременного использования.
+// Client is a connection to a MeshCore companion radio. All methods are safe
+// for concurrent use.
 type Client struct {
 	cfg Config
 	tr  Transport
 	br  *bufio.Reader
 
-	wmu sync.Mutex // сериализует записи кадров
-	cmu sync.Mutex // одна короткая транзакция «команда -> ответ» за раз
+	wmu sync.Mutex // serialises frame writes
+	cmu sync.Mutex // one short command/response transaction at a time
 
 	stop     chan struct{}
 	closed   chan struct{}
@@ -131,17 +128,15 @@ type Client struct {
 	channels []Channel
 
 	drainMu sync.Mutex
-
 	dropped atomic.Int64
 }
 
-// Dial подключается к компаньону и выполняет инициализацию сессии.
+// Dial connects to a companion and initialises the session.
 func Dial(tr Transport, cfg Config) (*Client, error) {
-	cfg = cfg.withDefaults()
 	c := &Client{
-		cfg:     cfg,
+		cfg:     cfg.withDefaults(),
 		tr:      tr,
-		br:      bufio.NewReaderSize(tr, 4096),
+		br:      bufio.NewReaderSize(tr, readBufSize),
 		stop:    make(chan struct{}),
 		closed:  make(chan struct{}),
 		pending: map[uint64]*pending{},
@@ -157,7 +152,7 @@ func Dial(tr Transport, cfg Config) (*Client, error) {
 	return c, nil
 }
 
-// DialTCPClient — подключение по WiFi/TCP одной строкой.
+// DialTCPClient connects over WiFi/TCP.
 func DialTCPClient(host string, port int, cfg Config) (*Client, error) {
 	tr, err := DialTCP(host, port)
 	if err != nil {
@@ -166,7 +161,7 @@ func DialTCPClient(host string, port int, cfg Config) (*Client, error) {
 	return Dial(tr, cfg)
 }
 
-// DialSerialClient — подключение по USB/COM-порту одной строкой.
+// DialSerialClient connects over USB.
 func DialSerialClient(port string, baud int, cfg Config) (*Client, error) {
 	tr, err := DialSerial(port, baud)
 	if err != nil {
@@ -175,7 +170,7 @@ func DialSerialClient(port string, baud int, cfg Config) (*Client, error) {
 	return Dial(tr, cfg)
 }
 
-// Close закрывает соединение и освобождает ресурсы.
+// Close shuts the connection down and releases resources.
 func (c *Client) Close() error {
 	var err error
 	c.stopOnce.Do(func() {
@@ -192,11 +187,11 @@ func (c *Client) Close() error {
 	return err
 }
 
-// Dropped возвращает число событий, отброшенных из-за переполнения буфера.
+// Dropped reports how many events were lost to a full subscription buffer.
 func (c *Client) Dropped() int64 { return c.dropped.Load() }
 
 // ---------------------------------------------------------------------------
-// Чтение и рассылка кадров
+// Framing and dispatch
 // ---------------------------------------------------------------------------
 
 func (c *Client) readLoop() {
@@ -214,7 +209,7 @@ func (c *Client) readLoop() {
 			case <-c.stop:
 			default:
 				c.connErr = err
-				c.cfg.Logf("meshcore: чтение прервано: %v", err)
+				c.cfg.Logf("meshcore: read loop stopped: %v", err)
 			}
 			return
 		}
@@ -229,21 +224,23 @@ func (c *Client) dispatch(f []byte) {
 	if c.cfg.Verbose {
 		c.cfg.Logf("<< [%d] %s (%s)", len(f), hex.EncodeToString(f), frameName(f[0]))
 	}
+	c.matchPending(f)
+	c.broadcast(f)
+}
 
-	// 1) синхронные ожидания (request/response и armed push-waiters)
+// matchPending delivers a frame to every armed waiter whose predicate accepts.
+func (c *Client) matchPending(f []byte) {
 	c.pmu.Lock()
+	defer c.pmu.Unlock()
 	for _, p := range c.pending {
-		if p.match(f) {
-			select {
-			case p.ch <- append([]byte(nil), f...):
-			default:
-			}
+		if !p.match(f) {
+			continue
+		}
+		select {
+		case p.ch <- append([]byte(nil), f...):
+		default:
 		}
 	}
-	c.pmu.Unlock()
-
-	// 2) подписчики
-	c.broadcast(f)
 }
 
 func (c *Client) broadcast(f []byte) {
@@ -251,19 +248,20 @@ func (c *Client) broadcast(f []byte) {
 	c.smu.RLock()
 	defer c.smu.RUnlock()
 	for _, s := range c.subs {
-		if s.wants(ev.Kind) {
-			select {
-			case s.ch <- ev:
-			default:
-				c.dropped.Add(1)
-			}
+		if !s.wants(ev.Kind) {
+			continue
+		}
+		select {
+		case s.ch <- ev:
+		default:
+			c.dropped.Add(1)
 		}
 	}
 }
 
 func (c *Client) writeFrame(payload []byte) error {
 	if len(payload) > maxFrameSize {
-		return fmt.Errorf("meshcore: кадр слишком большой: %d", len(payload))
+		return fmt.Errorf("meshcore: frame too large: %d bytes", len(payload))
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -274,14 +272,14 @@ func (c *Client) writeFrame(payload []byte) error {
 	return err
 }
 
-// send записывает кадр, удерживая блокировку команд (без ожидания ответа).
+// send writes a frame without waiting for a reply.
 func (c *Client) send(payload []byte) error {
 	c.cmu.Lock()
 	defer c.cmu.Unlock()
 	return c.writeFrame(payload)
 }
 
-// tx — короткая транзакция: отправить команду и дождаться одного из want.
+// tx runs one short transaction: send a command, wait for one of want.
 func (c *Client) tx(want []byte, payload []byte, timeout time.Duration) ([]byte, error) {
 	c.cmu.Lock()
 	defer c.cmu.Unlock()
@@ -293,8 +291,32 @@ func (c *Client) tx(want []byte, payload []byte, timeout time.Duration) ([]byte,
 	return p.next(timeout)
 }
 
+// txOK sends a command that must answer OK.
+func (c *Client) txOK(payload []byte) error {
+	f, err := c.tx([]byte{respOK, respErr}, payload, c.cfg.CommandTimeout)
+	switch {
+	case err != nil:
+		return err
+	case f[0] == respErr:
+		return frameError(f)
+	}
+	return nil
+}
+
+// txOne sends a command expecting exactly one reply code besides ERR.
+func (c *Client) txOne(want byte, payload []byte) ([]byte, error) {
+	f, err := c.tx([]byte{want, respErr}, payload, c.cfg.CommandTimeout)
+	switch {
+	case err != nil:
+		return nil, err
+	case f[0] == respErr:
+		return nil, frameError(f)
+	}
+	return f, nil
+}
+
 // ---------------------------------------------------------------------------
-// Ожидания
+// Waiters
 // ---------------------------------------------------------------------------
 
 type pending struct {
@@ -305,7 +327,7 @@ type pending struct {
 }
 
 func (c *Client) arm(match func([]byte) bool) *pending {
-	p := &pending{c: c, match: match, ch: make(chan []byte, 64)}
+	p := &pending{c: c, match: match, ch: make(chan []byte, pendingBuffer)}
 	c.pmu.Lock()
 	c.pseq++
 	p.id = c.pseq
@@ -320,23 +342,17 @@ func (p *pending) release() {
 	p.c.pmu.Unlock()
 }
 
-// next возвращает один кадр, НЕ снимая ожидание с регистрации.
+// next returns one frame and keeps the waiter armed.
 func (p *pending) next(d time.Duration) ([]byte, error) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case f := <-p.ch:
-		return f, nil
-	case <-t.C:
-		return nil, ErrTimeout
-	case <-p.c.stop:
-		return nil, ErrClosed
-	}
+	return p.waitSelect(d, nil)
 }
 
-// nextCtx ждёт кадр с учётом отмены через контекст. Побеждает то, что
-// случится раньше: кадр, таймаут, ctx или закрытие клиента.
+// nextCtx is next with context cancellation.
 func (p *pending) nextCtx(ctx context.Context, d time.Duration) ([]byte, error) {
+	return p.waitSelect(d, ctx.Done())
+}
+
+func (p *pending) waitSelect(d time.Duration, done <-chan struct{}) ([]byte, error) {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -344,20 +360,20 @@ func (p *pending) nextCtx(ctx context.Context, d time.Duration) ([]byte, error) 
 		return f, nil
 	case <-t.C:
 		return nil, ErrTimeout
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case <-done:
+		return nil, context.Canceled
 	case <-p.c.stop:
 		return nil, ErrClosed
 	}
 }
 
-// wait — next + автоматическое снятие с регистрации.
+// wait returns one frame and disarms the waiter.
 func (p *pending) wait(d time.Duration) ([]byte, error) {
 	defer p.release()
 	return p.next(d)
 }
 
-// collect ждёт кадр, удовлетворяющий ok, игнорируя прочие.
+// collect waits for a frame accepted by ok, ignoring the rest.
 func (p *pending) collect(d time.Duration, ok func([]byte) bool) ([]byte, error) {
 	defer p.release()
 	deadline := time.Now().Add(d)
@@ -377,18 +393,21 @@ func (p *pending) collect(d time.Duration, ok func([]byte) bool) ([]byte, error)
 }
 
 func matchAny(codes []byte) func([]byte) bool {
-	set := make(map[byte]bool, len(codes))
+	set := make(map[byte]struct{}, len(codes))
 	for _, c := range codes {
-		set[c] = true
+		set[c] = struct{}{}
 	}
-	return func(f []byte) bool { return len(f) > 0 && set[f[0]] }
+	return func(f []byte) bool {
+		_, ok := set[f[0]]
+		return len(f) > 0 && ok
+	}
 }
 
 // ---------------------------------------------------------------------------
-// Подписки на события
+// Events
 // ---------------------------------------------------------------------------
 
-// EventKind — тип события.
+// EventKind identifies an event.
 type EventKind int
 
 const (
@@ -412,7 +431,7 @@ const (
 	EventRawData
 )
 
-// Event — событие, доставляемое подписчику.
+// Event is delivered to subscribers.
 type Event struct {
 	Kind    EventKind
 	Frame   []byte
@@ -423,7 +442,7 @@ type Event struct {
 	PubKey  []byte
 }
 
-// Subscription — подписка на события.
+// Subscription receives events.
 type Subscription struct {
 	c     *Client
 	id    uint64
@@ -433,19 +452,18 @@ type Subscription struct {
 	once  sync.Once
 }
 
-// Subscribe регистрирует подписку. Без аргументов — на все события.
+// Subscribe registers a subscription. Without kinds it receives everything.
 func (c *Client) Subscribe(kinds ...EventKind) *Subscription {
 	return c.SubscribeBuffered(c.cfg.EventBuffer, kinds...)
 }
 
-// SubscribeBuffered — то же, но с явно заданным размером буфера.
+// SubscribeBuffered registers a subscription with an explicit buffer size.
 func (c *Client) SubscribeBuffered(size int, kinds ...EventKind) *Subscription {
-	if size <= 0 {
-		size = c.cfg.EventBuffer
-	}
-	s := &Subscription{c: c, kinds: map[EventKind]bool{}, ch: make(chan Event, size)}
-	if len(kinds) == 0 {
-		s.all = true
+	s := &Subscription{
+		c:     c,
+		kinds: make(map[EventKind]bool, len(kinds)),
+		ch:    make(chan Event, max(size, c.cfg.EventBuffer)),
+		all:   len(kinds) == 0,
 	}
 	for _, k := range kinds {
 		s.kinds[k] = true
@@ -460,10 +478,10 @@ func (c *Client) SubscribeBuffered(size int, kinds ...EventKind) *Subscription {
 
 func (s *Subscription) wants(k EventKind) bool { return s.all || s.kinds[k] }
 
-// Events возвращает канал событий.
+// Events returns the event channel.
 func (s *Subscription) Events() <-chan Event { return s.ch }
 
-// Cancel отписывается. Повторные вызовы безопасны.
+// Cancel unsubscribes. Repeated calls are safe.
 func (s *Subscription) Cancel() {
 	s.once.Do(func() {
 		s.c.smu.Lock()
@@ -514,8 +532,8 @@ func (c *Client) parseEvent(f []byte) Event {
 		ev.Kind = EventBinaryResponse
 	case pushAdvert:
 		ev.Kind = EventAdvert
-		if len(f) >= 7 {
-			ev.PubKey = append([]byte(nil), f[1:7]...)
+		if len(f) > pubKeyPrefixLen {
+			ev.PubKey = append([]byte(nil), f[1:1+pubKeyPrefixLen]...)
 		}
 	case pushNewAdvert:
 		ev.Kind = EventNewAdvert
@@ -538,10 +556,10 @@ func (c *Client) parseEvent(f []byte) Event {
 }
 
 // ---------------------------------------------------------------------------
-// Насос сообщений
+// Message pump
 // ---------------------------------------------------------------------------
 
-// pumpLoop вычитывает очередь сообщений прошивки по «щелчкам» MSG_WAITING.
+// pumpLoop drains the firmware message queue on every MSG_WAITING tick.
 func (c *Client) pumpLoop() {
 	sub := c.Subscribe(EventMsgWaiting)
 	defer sub.Cancel()
@@ -558,93 +576,80 @@ func (c *Client) pumpLoop() {
 	}
 }
 
-// DrainMessages вычитывает все накопленные сообщения из очереди прошивки.
+// DrainMessages pulls every queued message out of the firmware.
 func (c *Client) DrainMessages() {
 	c.drainMu.Lock()
 	defer c.drainMu.Unlock()
-	for i := 0; i < 512; i++ {
-		f, err := c.tx(
-			[]byte{respContactMsg, respContactMsgV3, respChannelMsg, respChannelMsgV3,
-				respChannelData, respNoMoreMsgs, respErr},
-			[]byte{cmdSyncNextMsg}, c.cfg.CommandTimeout)
-		if err != nil || len(f) == 0 {
+
+	want := []byte{respContactMsg, respContactMsgV3, respChannelMsg, respChannelMsgV3,
+		respChannelData, respNoMoreMsgs, respErr}
+
+	for i := 0; i < drainLimit; i++ {
+		f, err := c.tx(want, []byte{cmdSyncNextMsg}, c.cfg.CommandTimeout)
+		if err != nil || len(f) == 0 || f[0] == respNoMoreMsgs || f[0] == respErr {
 			return
 		}
-		if f[0] == respNoMoreMsgs || f[0] == respErr {
-			return
-		}
-		// только подписчикам: pending-ожидания уже увидели кадр внутри tx
-		c.broadcast(f)
+		c.broadcast(f) // waiters already saw the frame inside tx
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Инициализация
+// Session start
 // ---------------------------------------------------------------------------
 
 func (c *Client) handshake() error {
-	deadline := c.cfg.CommandTimeout * 2
+	timeout := c.cfg.CommandTimeout * handshakeFactor
 
-	// APP_START: 1 + 7 зарезервированных + имя приложения.
-	// Побочный эффект: прошивка сбрасывает _iter_started, поэтому
-	// GET_CONTACTS не вернёт BAD_STATE из-за чужого незакрытого списка.
-	start := make([]byte, 8, 40)
-	start[0] = cmdAppStart
-	start = append(start, []byte(c.cfg.AppName)...)
-	f, err := c.tx([]byte{respSelfInfo, respErr}, start, deadline)
-	if err != nil {
+	// APP_START also resets the firmware contact iterator, so GET_CONTACTS
+	// cannot fail with BAD_STATE left over from another client.
+	payload := append([]byte{cmdAppStart}, zeros(handshakeReservedLen)...)
+	payload = append(payload, []byte(c.cfg.AppName)...)
+
+	f, err := c.tx([]byte{respSelfInfo, respErr}, payload, timeout)
+	switch {
+	case err != nil:
 		return fmt.Errorf("meshcore: APP_START: %w", err)
-	}
-	if f[0] == respErr {
+	case f[0] == respErr:
 		return frameError(f)
 	}
 	if si, ok := parseSelfInfo(f); ok {
 		c.setSelf(si)
 	}
 
-	// DEVICE_QUERY: сообщаем версию протокола (>= 3 -> кадры V3 с SNR).
-	f, err = c.tx([]byte{respDeviceInfo, respErr}, []byte{cmdDeviceQuery, appTargetVer}, deadline)
+	// DEVICE_QUERY announces the protocol version we understand (>= 3 gives
+	// V3 frames carrying SNR).
+	f, err = c.tx([]byte{respDeviceInfo, respErr},
+		[]byte{cmdDeviceQuery, appTargetVer}, timeout)
 	if err != nil {
 		return fmt.Errorf("meshcore: DEVICE_QUERY: %w", err)
 	}
-	if f[0] == respDeviceInfo {
-		if di, ok := parseDeviceInfo(f); ok {
-			c.setDevice(di)
-		}
+	if di, ok := parseDeviceInfo(f); ok {
+		c.setDevice(di)
 	}
 
-	// SET_DEVICE_TIME: прошивка принимает только время «вперёд», ошибку игнорируем.
-	ts := make([]byte, 5)
-	ts[0] = cmdSetDeviceTime
-	binary.LittleEndian.PutUint32(ts[1:], uint32(time.Now().Unix()))
-	_, _ = c.tx([]byte{respOK, respErr}, ts, deadline)
+	// SET_DEVICE_TIME only accepts forward jumps; an error here is harmless.
+	_, _ = c.tx([]byte{respOK, respErr},
+		frame(cmdSetDeviceTime, u32le(uint32(time.Now().Unix()))), timeout)
 
-	// Кэшируем контакты и каналы.
 	if _, err := c.RefreshContacts(context.Background()); err != nil {
-		c.cfg.Logf("meshcore: загрузка контактов: %v", err)
+		c.cfg.Logf("meshcore: contact load failed: %v", err)
 	}
 	if _, err := c.RefreshChannels(); err != nil {
-		c.cfg.Logf("meshcore: загрузка каналов: %v", err)
+		c.cfg.Logf("meshcore: channel load failed: %v", err)
 	}
 	c.DrainMessages()
 	return nil
 }
 
-// clampWait приводит suggested_timeout прошивки к рабочим границам.
-// meshcore_py считает suggested_timeout/800 секунд, что эквивалентно
-// миллисекундам × 1.25 — отсюда AckSlack по умолчанию.
+// clampWait scales the firmware suggested_timeout into working bounds.
+// meshcore_py uses suggested_timeout/800 seconds, i.e. millis * 1.25, which is
+// what the default AckSlack reproduces.
 func (c *Client) clampWait(suggestedMillis uint32) time.Duration {
 	w := time.Duration(suggestedMillis) * time.Millisecond
 	if c.cfg.AckSlack > 0 {
 		w = time.Duration(float64(w) * c.cfg.AckSlack)
 	}
-	if w < c.cfg.MinWait {
-		w = c.cfg.MinWait
-	}
-	if w > c.cfg.MaxWait {
-		w = c.cfg.MaxWait
-	}
-	return w
+	return min(max(w, c.cfg.MinWait), c.cfg.MaxWait)
 }
 
 func (c *Client) sleep(d time.Duration) {

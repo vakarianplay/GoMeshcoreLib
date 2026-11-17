@@ -1,4 +1,4 @@
-package meshcore
+package GoMeshcoreLib
 
 import (
 	"context"
@@ -9,19 +9,19 @@ import (
 	"time"
 )
 
-// SendResult — итог отправки личного сообщения.
+// SendResult is the outcome of a direct message send.
 type SendResult struct {
 	Acked          bool
 	Attempts       int
 	DirectAttempts int
 	FloodAttempts  int
-	Route          string // "direct" или "flood" успешной попытки
+	Route          string
 	Tag            uint32
 	TripTime       time.Duration
 	Err            error
 }
 
-// SendDirectMessage отправляет личное сообщение контакту по имени.
+// SendDirectMessage sends a direct message to a contact given by name.
 func (c *Client) SendDirectMessage(ctx context.Context, contactName, text string) (*SendResult, error) {
 	ct, err := c.ResolveContact(ctx, contactName)
 	if err != nil {
@@ -30,18 +30,17 @@ func (c *Client) SendDirectMessage(ctx context.Context, contactName, text string
 	return c.SendDirectMessageTo(ctx, ct, text)
 }
 
-// SendDirectMessageTo отправляет личное сообщение с политикой повторов:
-// сначала cfg.DirectAttempts попыток по последнему известному маршруту,
-// затем маршрут сбрасывается и делается cfg.FloodAttempts широковещательных.
+// SendDirectMessageTo sends a direct message using the retry policy:
+// DirectAttempts over the last known path, then ResetPath and FloodAttempts
+// over flood.
 func (c *Client) SendDirectMessageTo(ctx context.Context, ct *Contact, text string) (*SendResult, error) {
 	if err := checkText(text); err != nil {
 		return nil, err
 	}
 	res := &SendResult{}
-	direct, flood := c.cfg.DirectAttempts, c.cfg.FloodAttempts
-	total := direct + flood
-	// Одинаковая метка времени на все попытки: уникальность пакету даёт номер
-	// попытки, что позволяет получателям распознавать ретрансли.
+	total := c.cfg.DirectAttempts + c.cfg.FloodAttempts
+	// One timestamp for every try: the attempt number is what makes each
+	// packet unique and lets receivers spot retries.
 	ts := uint32(time.Now().Unix())
 	flooded := false
 
@@ -50,81 +49,67 @@ func (c *Client) SendDirectMessageTo(ctx context.Context, ct *Contact, text stri
 			res.Err = err
 			return res, err
 		}
-		if !flooded && i == direct && flood > 0 {
+		if !flooded && i == c.cfg.DirectAttempts && c.cfg.FloodAttempts > 0 {
 			if err := c.ResetPath(ctx, ct); err != nil {
-				c.cfg.Logf("meshcore: сброс маршрута: %v", err)
+				c.cfg.Logf("meshcore: path reset failed: %v", err)
 			}
 			flooded = true
-			c.cfg.Logf("meshcore: прямой маршрут исчерпан (%d), переход на flood", direct)
+			c.cfg.Logf("meshcore: direct path exhausted (%d tries), switching to flood",
+				c.cfg.DirectAttempts)
 		}
 		res.Attempts = i + 1
 
-		// Подписываемся на ACK ДО отправки: подтверждение может прийти
-		// сразу вслед за SENT.
+		// Arm before sending: the ACK can follow SENT immediately.
 		ack := c.arm(func(f []byte) bool {
-			return len(f) >= 5 && f[0] == pushSendConfirmed
+			return len(f) >= ackFrameLen && f[0] == pushSendConfirmed
 		})
 
-		payload := make([]byte, 0, 13+len(text))
-		payload = append(payload, cmdSendTxtMsg, TxtTypePlain, byte(i))
-		var tb [4]byte
-		binary.LittleEndian.PutUint32(tb[:], ts)
-		payload = append(payload, tb[:]...)
-		payload = append(payload, ct.Prefix()...)
-		payload = append(payload, []byte(text)...)
+		payload := frame(cmdSendTxtMsg, []byte{TxtTypePlain, byte(i)},
+			u32le(ts), ct.Prefix(), []byte(text))
 
 		sent, err := c.tx([]byte{respSent, respErr}, payload, c.cfg.CommandTimeout)
-		if err != nil {
+		if err != nil || (len(sent) > 0 && sent[0] == respErr) {
 			ack.release()
+			if err == nil {
+				err = frameError(sent)
+			}
 			res.Err = err
-			c.cfg.Logf("meshcore: попытка %d: %v", i+1, err)
-			c.sleep(c.cfg.RetryDelay)
-			continue
-		}
-		if sent[0] == respErr {
-			ack.release()
-			res.Err = frameError(sent)
-			if errors.Is(res.Err, ErrNotFound) {
-				return res, res.Err
+			c.cfg.Logf("meshcore: attempt %d failed: %v", i+1, err)
+			if errors.Is(err, ErrNotFound) {
+				return res, err
 			}
 			c.sleep(c.cfg.RetryDelay)
 			continue
 		}
-		if len(sent) < 10 {
+		if len(sent) < sentFrameLen {
 			ack.release()
-			res.Err = fmt.Errorf("meshcore: короткий кадр SENT: %d", len(sent))
+			res.Err = fmt.Errorf("meshcore: short SENT frame: %d bytes", len(sent))
 			c.sleep(c.cfg.RetryDelay)
 			continue
 		}
 
-		tag := binary.LittleEndian.Uint32(sent[2:6])
-		est := binary.LittleEndian.Uint32(sent[6:10])
-		res.Tag = tag
-		if sent[1] == 1 {
-			res.Route = "flood"
-			res.FloodAttempts++
-		} else {
-			res.Route = "direct"
-			res.DirectAttempts++
-		}
+		res.Tag = binary.LittleEndian.Uint32(sent[sentTagIdx : sentTagIdx+4])
+		res.Route, _ = c.recordRoute(res, sent)
+		wait := c.clampWait(binary.LittleEndian.Uint32(sent[sentTimeoutIdx : sentTimeoutIdx+4]))
+		c.cfg.Logf("meshcore: attempt %d (%s, tag=%08x), waiting %s for ACK",
+			i+1, res.Route, res.Tag, wait)
 
-		wait := c.clampWait(est)
-		c.cfg.Logf("meshcore: попытка %d (%s, tag=%08x), жду ACK %s",
-			i+1, res.Route, tag, wait)
-
+		tag := res.Tag
 		f, err := ack.collect(wait, func(fr []byte) bool {
-			return len(fr) >= 5 && binary.LittleEndian.Uint32(fr[1:5]) == tag
+			return len(fr) >= ackFrameLen &&
+				binary.LittleEndian.Uint32(fr[1:5]) == tag
 		})
-		if err == nil {
-			res.Acked = true
-			res.Err = nil
-			if len(f) >= 9 {
-				res.TripTime = time.Duration(binary.LittleEndian.Uint32(f[5:9])) * time.Millisecond
-			}
-			return res, nil
+		if err != nil {
+			res.Err = ErrNoAck
+			c.sleep(c.cfg.RetryDelay)
+			continue
 		}
-		res.Err = ErrNoAck
-		c.sleep(c.cfg.RetryDelay)
+
+		res.Acked, res.Err = true, nil
+		if len(f) >= ackTripFrameLen {
+			res.TripTime = time.Duration(binary.LittleEndian.Uint32(f[5:9])) * time.Millisecond
+		}
+		return res, nil
 	}
 
 	if res.Err == nil {
@@ -133,90 +118,68 @@ func (c *Client) SendDirectMessageTo(ctx context.Context, ct *Contact, text stri
 	return res, res.Err
 }
 
+// recordRoute notes which route a SENT frame used and returns its name.
+func (c *Client) recordRoute(res *SendResult, sent []byte) (string, bool) {
+	flood := sent[sentRouteIdx] == sentRouteFlood
+	if flood {
+		res.FloodAttempts++
+		return "flood", true
+	}
+	res.DirectAttempts++
+	return "direct", false
+}
+
 // ---------------------------------------------------------------------------
-// Групповые (хэштег) каналы
+// Group (hashtag) channels
 // ---------------------------------------------------------------------------
 
-// ChannelOptions — параметры отправки в канал.
+// ChannelOptions configures a channel send.
 type ChannelOptions struct {
-	// Scope — регион рассылки, например "vostok". Пусто = scope узла.
-	Scope string
-	// Unscoped — классическая неограниченная рассылка (игнорирует Scope).
-	Unscoped bool
-	// Attempts переопределяет cfg.ChannelAttempts.
-	Attempts int
-	// EchoWindow переопределяет cfg.EchoWindow.
-	EchoWindow time.Duration
-	// RequireRepeats — сколько эхо одного пакета считать подтверждением.
-	RequireRepeats int
-	// RestoreScope — вернуть прежнее состояние scope после отправки (по умолч. true).
-	RestoreScope *bool
+	Scope          string        // region, e.g. "vostok"; empty keeps the node default
+	Unscoped       bool          // classic unscoped flood, ignores Scope
+	Attempts       int           // overrides cfg.ChannelAttempts
+	EchoWindow     time.Duration // overrides cfg.EchoWindow
+	RequireRepeats int           // echoes of one packet counted as proof
+	RestoreScope   *bool         // restore the previous scope afterwards (default true)
 }
 
 func (o ChannelOptions) restore() bool { return o.RestoreScope == nil || *o.RestoreScope }
 
-// ChannelSendResult — итог отправки в канал.
+// ChannelSendResult is the outcome of a channel send.
 type ChannelSendResult struct {
-	Sent     bool // прошивка приняла сообщение (RESP_CODE_OK)
-	Heard    bool // хотя бы один ретранслятор повторил пакет
+	Sent     bool // firmware accepted the message (RESP_CODE_OK)
+	Heard    bool // at least one repeater echoed the packet
 	Attempts int
 	Echoes   []Echo
 	Err      error
 }
 
-// SendChannelMessage отправляет сообщение в хэштег-канал, при необходимости
-// задавая регион, и повторяет отправку, пока пакет не повторит ретранслятор.
+// SendChannelMessage posts to a hashtag channel, optionally setting a region,
+// and retries until a repeater echoes the packet.
 //
-// ВАЖНО об определении «услышанности»: для групповых сообщений прошивка
-// отвечает лишь RESP_CODE_OK — ни tag, ни expected_ack не возвращаются
-// (в отличие от личных сообщений). Поэтому подтверждение строится на эхо из
-// rx_log (0x88): ретранслятор, повторивший пакет, наращивает в нём маршрут,
-// и мы видим этот повтор с SNR/RSSI. Атрибуция эхо нашему пакету — эвристика:
-// тип полезной нагрузки GRP_TXT, непустой маршрут и кластеризация по
-// побайтовому совпадению payload (ретрансляторы payload не меняют).
+// Channel messages get no tag back — the firmware answers RESP_CODE_OK only —
+// so "heard" is derived from rx_log echoes: a repeater that forwards the packet
+// appends its hop hash, and we see that copy with SNR and RSSI. Matching an
+// echo to our packet is heuristic: GRP_TXT payload, non-empty path, and
+// byte-identical payload clustering (repeaters never alter the payload).
 func (c *Client) SendChannelMessage(ctx context.Context, ch Channel, text string,
 	opts ChannelOptions) (*ChannelSendResult, error) {
 	if err := checkText(text); err != nil {
 		return nil, err
 	}
 	res := &ChannelSendResult{}
+	attempts, window, require := c.channelPolicy(opts)
 
-	attempts := opts.Attempts
-	if attempts <= 0 {
-		attempts = c.cfg.ChannelAttempts
+	restore, err := c.applyScope(ctx, opts)
+	if err != nil {
+		return nil, err
 	}
-	window := opts.EchoWindow
-	if window <= 0 {
-		window = c.cfg.EchoWindow
-	}
-	require := opts.RequireRepeats
-	if require <= 0 {
-		require = c.cfg.RequireRepeats
+	if restore {
+		defer c.restoreScope()
 	}
 
-	// Регион.
-	scopeChanged := false
-	if opts.Unscoped {
-		if err := c.SetUnscoped(ctx); err != nil {
-			return nil, err
-		}
-		scopeChanged = true
-	} else if opts.Scope != "" {
-		if err := c.SetFloodScope(ctx, opts.Scope); err != nil {
-			return nil, err
-		}
-		scopeChanged = true
-	}
-	if scopeChanged && opts.restore() {
-		defer func() {
-			if err := c.ClearFloodScope(context.Background()); err != nil {
-				c.cfg.Logf("meshcore: возврат scope: %v", err)
-			}
-		}()
-	}
-
-	// Подписка на rx_log нужна ДО первой отправки, иначе первое эхо теряется.
-	sub := c.SubscribeBuffered(1024, EventRxLog)
+	// Subscribe before the first send so the earliest echo is not lost.
+	sub := c.SubscribeBuffered(defaultEchoBuffer, EventRxLog)
 	defer sub.Cancel()
 
 	for i := 0; i < attempts; i++ {
@@ -225,26 +188,19 @@ func (c *Client) SendChannelMessage(ctx context.Context, ch Channel, text string
 			return res, err
 		}
 		res.Attempts = i + 1
-		ts := uint32(time.Now().Unix())
 
-		payload := make([]byte, 0, 7+len(text))
-		payload = append(payload, cmdSendChannelTxt, TxtTypePlain, ch.Index)
-		var tb [4]byte
-		binary.LittleEndian.PutUint32(tb[:], ts)
-		payload = append(payload, tb[:]...)
-		payload = append(payload, []byte(text)...)
+		payload := frame(cmdSendChannelTxt, []byte{TxtTypePlain, ch.Index},
+			u32le(uint32(time.Now().Unix())), []byte(text))
 
 		f, err := c.tx([]byte{respOK, respErr}, payload, c.cfg.CommandTimeout)
-		if err != nil {
+		if err != nil || (len(f) > 0 && f[0] == respErr) {
+			if err == nil {
+				err = frameError(f)
+			}
 			res.Err = err
-			c.cfg.Logf("meshcore: канал, попытка %d: %v", i+1, err)
-			continue
-		}
-		if f[0] == respErr {
-			res.Err = frameError(f)
-			c.cfg.Logf("meshcore: канал, попытка %d: %v", i+1, res.Err)
-			if errors.Is(res.Err, ErrNotFound) {
-				return res, res.Err
+			c.cfg.Logf("meshcore: channel attempt %d failed: %v", i+1, err)
+			if errors.Is(err, ErrNotFound) {
+				return res, err
 			}
 			continue
 		}
@@ -253,12 +209,10 @@ func (c *Client) SendChannelMessage(ctx context.Context, ch Channel, text string
 		echoes, err := c.waitForEchoes(ctx, sub, window, require)
 		if err != nil {
 			res.Err = err
-			c.cfg.Logf("meshcore: канал, попытка %d: эхо не дождались", i+1)
+			c.cfg.Logf("meshcore: channel attempt %d: no echo confirmed", i+1)
 			continue
 		}
-		res.Heard = true
-		res.Echoes = echoes
-		res.Err = nil
+		res.Heard, res.Echoes, res.Err = true, echoes, nil
 		return res, nil
 	}
 
@@ -268,9 +222,40 @@ func (c *Client) SendChannelMessage(ctx context.Context, ch Channel, text string
 	return res, res.Err
 }
 
-// waitForEchoes собирает эхо GRP_TXT-пакетов и возвращает первый кластер,
-// достигший require повторов. Кластеризация — по побайтовому совпадению
-// payload: ретрансляторы меняют только маршрут, полезная нагрузка остаётся.
+func (c *Client) channelPolicy(o ChannelOptions) (attempts int, window time.Duration, require int) {
+	attempts, window, require = c.cfg.ChannelAttempts, c.cfg.EchoWindow, c.cfg.RequireRepeats
+	if o.Attempts > 0 {
+		attempts = o.Attempts
+	}
+	if o.EchoWindow > 0 {
+		window = o.EchoWindow
+	}
+	if o.RequireRepeats > 0 {
+		require = o.RequireRepeats
+	}
+	return
+}
+
+// applyScope sets the region for this send and reports whether it must be
+// restored afterwards.
+func (c *Client) applyScope(ctx context.Context, o ChannelOptions) (bool, error) {
+	switch {
+	case o.Unscoped:
+		return true, c.SetUnscoped(ctx)
+	case o.Scope != "":
+		return true, c.SetFloodScope(ctx, o.Scope)
+	}
+	return false, nil
+}
+
+func (c *Client) restoreScope() {
+	if err := c.ClearFloodScope(context.Background()); err != nil {
+		c.cfg.Logf("meshcore: scope restore failed: %v", err)
+	}
+}
+
+// waitForEchoes collects GRP_TXT echoes and returns the first cluster reaching
+// require repeats. Clustering is by byte-identical payload.
 func (c *Client) waitForEchoes(ctx context.Context, sub *Subscription, window time.Duration,
 	require int) ([]Echo, error) {
 	deadline := time.After(window)
@@ -284,24 +269,15 @@ func (c *Client) waitForEchoes(ctx context.Context, sub *Subscription, window ti
 			return nil, ErrTimeout
 		case ev, ok := <-sub.Events():
 			if !ok {
-				// подписку отменили извне — иначе цикл ушёл бы в busy-loop
-				return nil, ErrClosed
+				return nil, ErrClosed // cancelled elsewhere: avoid a busy loop
 			}
-			if ev.RxLog == nil || ev.RxLog.Pkt == nil {
+			if !isRepeatedGroupPacket(ev.RxLog) {
 				continue
 			}
-			pkt := ev.RxLog.Pkt
-			// Только групповые текстовые пакеты, повторённые ретранслятором.
-			if pkt.PayloadType != payloadGrpTxt || !pkt.Path.Repeated() {
-				continue
-			}
-			key := hex.EncodeToString(pkt.Payload)
+			key := hex.EncodeToString(ev.RxLog.Pkt.Payload)
 			clusters[key] = append(clusters[key], Echo{
-				At:   ev.RxLog.At,
-				SNR:  ev.RxLog.SNR,
-				RSSI: ev.RxLog.RSSI,
-				Path: pkt.Path,
-				Pkt:  pkt,
+				At: ev.RxLog.At, SNR: ev.RxLog.SNR, RSSI: ev.RxLog.RSSI,
+				Path: ev.RxLog.Pkt.Path, Pkt: ev.RxLog.Pkt,
 			})
 			if len(clusters[key]) >= require {
 				return clusters[key], nil
@@ -310,17 +286,22 @@ func (c *Client) waitForEchoes(ctx context.Context, sub *Subscription, window ti
 	}
 }
 
+// isRepeatedGroupPacket reports whether an rx_log entry is a group text packet
+// that at least one repeater forwarded.
+func isRepeatedGroupPacket(e *RxLogEntry) bool {
+	return e != nil && e.Pkt != nil &&
+		e.Pkt.PayloadType == payloadGrpTxt && e.Pkt.Path.Repeated()
+}
+
 // ---------------------------------------------------------------------------
-// Вспомогательное
+// Helpers
 // ---------------------------------------------------------------------------
 
-// SplitText разбивает длинный текст на части не длиннее MaxTextLen,
-// добавляя индикатор "[i/n]".
+// SplitText splits long text into chunks of at most MaxTextLen runes, tagged
+// "[i/n]".
 func SplitText(text string) []string {
-	limit := MaxTextLen - len("[00/00] ")
-	if limit < 20 {
-		limit = 20
-	}
+	limit := max(MaxTextLen-len("[00/00] "), chunkTagMin)
+
 	runes := []rune(text)
 	var chunks []string
 	for len(runes) > limit {
@@ -331,41 +312,39 @@ func SplitText(text string) []string {
 	if len(chunks) == 1 {
 		return chunks
 	}
+
 	out := make([]string, len(chunks))
 	for i, ch := range chunks {
-		out[i] = fmt.Sprintf("[%d/%d] %s", i+1, len(chunks), ch)
+		out[i] = fmt.Sprintf(chunkTagFormat, i+1, len(chunks), ch)
 	}
 	return out
 }
 
-// Login выполняет вход на репитер или room-сервер. Нужен только для
-// административных действий; телеметрия и сообщения его не требуют.
+// Login signs into a repeater or room server. Only administrative actions need
+// it; messages and telemetry do not.
 func (c *Client) Login(ctx context.Context, ct *Contact, password string) error {
 	push := c.arm(matchAny([]byte{pushLoginSuccess, pushLoginFail}))
 	defer push.release()
 
-	payload := make([]byte, 0, 33+len(password))
-	payload = append(payload, cmdSendLogin)
-	payload = append(payload, ct.PublicKey[:]...)
-	payload = append(payload, []byte(password)...)
-
+	payload := frame(cmdSendLogin, ct.PublicKey[:], []byte(password))
 	sent, err := c.tx([]byte{respSent, respErr}, payload, c.cfg.CommandTimeout)
-	if err != nil {
+	switch {
+	case err != nil:
 		return err
-	}
-	if sent[0] == respErr {
+	case sent[0] == respErr:
 		return frameError(sent)
 	}
+
 	est := uint32(0)
-	if len(sent) >= 10 {
-		est = binary.LittleEndian.Uint32(sent[6:10])
+	if len(sent) >= sentFrameLen {
+		est = binary.LittleEndian.Uint32(sent[sentTimeoutIdx : sentTimeoutIdx+4])
 	}
 	f, err := push.wait(c.clampWait(est))
-	if err != nil {
+	switch {
+	case err != nil:
 		return err
-	}
-	if f[0] == pushLoginFail {
-		return errors.New("meshcore: вход отклонён (неверный пароль)")
+	case f[0] == pushLoginFail:
+		return errors.New("meshcore: login rejected (bad password)")
 	}
 	return nil
 }
