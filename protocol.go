@@ -1,4 +1,4 @@
-package meshcore
+package GoMeshcoreLib
 
 import (
 	"bufio"
@@ -11,168 +11,38 @@ import (
 	"strings"
 )
 
-// --- обрамление кадров (SerialWifiInterface.cpp / ArduinoSerialInterface.cpp)
-const (
-	frameOutMagic byte = '<' // app -> radio
-	frameInMagic  byte = '>' // radio -> app
-	maxFrameSize       = 512
-)
-
-// --- команды (CMD_*) ---
-const (
-	cmdAppStart       byte = 1
-	cmdSendTxtMsg     byte = 2
-	cmdSendChannelTxt byte = 3
-	cmdGetContacts    byte = 4
-	cmdGetDeviceTime  byte = 5
-	cmdSetDeviceTime  byte = 6
-	cmdSendSelfAdvert byte = 7
-	cmdAddUpdateCtc   byte = 9
-	cmdSyncNextMsg    byte = 10
-	cmdResetPath      byte = 13
-	cmdGetBattStorage byte = 20
-	cmdDeviceQuery    byte = 22
-	cmdSendLogin      byte = 26
-	cmdGetContactKey  byte = 30
-	cmdGetChannel     byte = 31
-	cmdSetChannel     byte = 32
-	cmdSetOtherParams byte = 38
-	cmdSendTelemetry  byte = 39 // 0x27
-	cmdGetAdvertPath  byte = 42
-	cmdSetFloodScope  byte = 54
-	cmdGetStats       byte = 56
-	cmdSetDefaultScp  byte = 63
-	cmdGetDefaultScp  byte = 64
-	cmdRunCLI         byte = 66 // v14+
-
-	appTargetVer byte = 3
-)
-
-// --- ответы (RESP_CODE_*) ---
-const (
-	respOK            byte = 0
-	respErr           byte = 1
-	respContactsStart byte = 2
-	respContact       byte = 3
-	respContactsEnd   byte = 4
-	respSelfInfo      byte = 5
-	respSent          byte = 6
-	respContactMsg    byte = 7
-	respChannelMsg    byte = 8
-	respCurrTime      byte = 9
-	respNoMoreMsgs    byte = 10
-	respBattStorage   byte = 12
-	respDeviceInfo    byte = 13
-	respDisabled      byte = 15
-	respContactMsgV3  byte = 16
-	respChannelMsgV3  byte = 17
-	respChannelInfo   byte = 18
-	respAdvertPath    byte = 22
-	respStats         byte = 24
-	respChannelData   byte = 27
-	respDefaultScope  byte = 28
-	respCLIReply      byte = 29
-)
-
-// --- пуши (PUSH_CODE_*) ---
-const (
-	pushAdvert        byte = 0x80
-	pushPathUpdated   byte = 0x81
-	pushSendConfirmed byte = 0x82
-	pushMsgWaiting    byte = 0x83
-	pushRawData       byte = 0x84
-	pushLoginSuccess  byte = 0x85
-	pushLoginFail     byte = 0x86
-	pushStatusResp    byte = 0x87
-	pushRxLog         byte = 0x88
-	pushTraceData     byte = 0x89
-	pushNewAdvert     byte = 0x8A
-	pushTelemetry     byte = 0x8B
-	pushBinaryResp    byte = 0x8C
-	pushPathDiscovery byte = 0x8D
-	pushControlData   byte = 0x8E
-)
-
-// --- типы узлов и текста ---
-const (
-	AdvTypeNone     byte = 0
-	AdvTypeChat     byte = 1
-	AdvTypeRepeater byte = 2
-	AdvTypeRoom     byte = 3
-	AdvTypeSensor   byte = 4
-)
-
-const (
-	TxtTypePlain       byte = 0
-	TxtTypeCLIData     byte = 1
-	TxtTypeSignedPlain byte = 2
-	TxtTypeCLICmd      byte = 3
-)
-
-// --- заголовок пакета (Packet.h) ---
-const (
-	routeTransportFlood  uint8 = 0x00
-	routeFlood           uint8 = 0x01
-	routeDirect          uint8 = 0x02
-	routeTransportDirect uint8 = 0x03
-
-	payloadReq       uint8 = 0x00
-	payloadResponse  uint8 = 0x01
-	payloadTxtMsg    uint8 = 0x02
-	payloadAck       uint8 = 0x03
-	payloadAdvert    uint8 = 0x04
-	payloadGrpTxt    uint8 = 0x05
-	payloadGrpData   uint8 = 0x06
-	payloadAnonReq   uint8 = 0x07
-	payloadPath      uint8 = 0x08
-	payloadTrace     uint8 = 0x09
-	payloadMultipart uint8 = 0x0A
-	payloadControl   uint8 = 0x0B
-	payloadRawCustom uint8 = 0x0F
-)
-
-// MaxTextLen — предел длины текста одного сообщения (спецификация MeshCore).
-const MaxTextLen = 133
-
-// OutPathUnknown — маркер «маршрут неизвестен / direct» в поле path_len.
-const OutPathUnknown byte = 0xFF
-
-// PublicChannelKey — общеизвестный ключ канала Public.
+// PublicChannelKey is the well-known secret of the built-in Public channel.
 var PublicChannelKey = [16]byte{
 	0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
 	0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
 }
 
-// Ошибки библиотеки.
+// OutPathUnknown marks an unknown or direct path in a path_len field.
+const OutPathUnknown byte = pathLenDirect
+
+// Sentinel errors.
 var (
-	ErrTimeout        = errors.New("meshcore: таймаут")
-	ErrClosed         = errors.New("meshcore: клиент закрыт")
-	ErrNotFound       = errors.New("meshcore: не найдено")
-	ErrNoAck          = errors.New("meshcore: ACK не получен")
-	ErrNotHeard       = errors.New("meshcore: сообщение не услышал ни один ретранслятор")
-	ErrTextTooLong    = errors.New("meshcore: текст длиннее 133 байт")
-	ErrNoChannelSlots = errors.New("meshcore: нет свободного слота канала")
-	ErrUnsupported    = errors.New("meshcore: команда не поддерживается прошивкой")
+	ErrTimeout        = errors.New("meshcore: timeout")
+	ErrClosed         = errors.New("meshcore: client closed")
+	ErrNotFound       = errors.New("meshcore: not found")
+	ErrNoAck          = errors.New("meshcore: no ACK received")
+	ErrNotHeard       = errors.New("meshcore: no repeater echoed the message")
+	ErrTextTooLong    = errors.New("meshcore: text exceeds the 133 byte limit")
+	ErrNoChannelSlots = errors.New("meshcore: no free channel slot")
+	ErrUnsupported    = errors.New("meshcore: command unsupported by firmware")
 )
 
-// ---------------------------------------------------------------------------
-// Ключи
-// ---------------------------------------------------------------------------
-
-// NormalizeHashtag приводит имя к виду "#name".
+// NormalizeHashtag returns the name prefixed with '#'.
 func NormalizeHashtag(name string) string {
 	name = strings.TrimSpace(name)
-	if name == "" {
+	if name == "" || strings.HasPrefix(name, "#") {
 		return name
 	}
-	if !strings.HasPrefix(name, "#") {
-		return "#" + name
-	}
-	return name
+	return "#" + name
 }
 
-// DeriveKey16 — первые 16 байт SHA-256. Одинаково используется и для ключа
-// хэштег-канала, и для ключа региона (TransportKeyStore::getAutoKeyFor).
+// DeriveKey16 returns the first 16 bytes of SHA-256(name). The firmware uses
+// the same derivation for hashtag channel keys and region transport keys.
 func DeriveKey16(name string) [16]byte {
 	h := sha256.Sum256([]byte(name))
 	var k [16]byte
@@ -180,68 +50,58 @@ func DeriveKey16(name string) [16]byte {
 	return k
 }
 
-// ---------------------------------------------------------------------------
-// Маршрут
-// ---------------------------------------------------------------------------
-
-// PathInfo — декодированное поле path_len и, если доступны, сами хэши.
+// PathInfo is a decoded path_len byte plus the hop hashes when available.
 type PathInfo struct {
 	Encoded   byte
 	Valid     bool
-	Flood     bool // false = direct (маркер 0xFF)
-	HashSize  int  // байт на один хэш: 1..3
-	HashCount int  // число хопов
+	Flood     bool // false means direct (marker 0xFF)
+	HashSize  int  // bytes per hop hash: 1..3
+	HashCount int  // number of hops
 	Bytes     []byte
-	Hops      []string // hex каждого хопа
+	Hops      []string
 }
 
-// Repeated сообщает, добавил ли хотя бы один ретранслятор свой хэш.
+// Repeated reports whether at least one repeater appended its hash.
 func (p PathInfo) Repeated() bool { return p.HashCount > 0 && len(p.Bytes) > 0 }
 
-// String — человекочитаемое представление.
 func (p PathInfo) String() string {
-	if !p.Valid {
+	switch {
+	case !p.Valid:
 		return fmt.Sprintf("invalid(0x%02x)", p.Encoded)
-	}
-	if !p.Flood {
+	case !p.Flood:
 		return "direct"
-	}
-	if p.HashCount == 0 {
+	case p.HashCount == 0:
 		return "flood/0hop"
+	default:
+		return fmt.Sprintf("flood[%s]", strings.Join(p.Hops, ""))
 	}
-	return fmt.Sprintf("flood[%s]", strings.Join(p.Hops, ""))
 }
 
-// decodePathLenByte разбирает одиночный байт path_len из кадров
-// companion-протокола (сами хэши там не передаются).
+// decodePathLenByte decodes a lone path_len byte, as carried by message frames.
 func decodePathLenByte(b byte) PathInfo {
-	p := PathInfo{Encoded: b}
+	p := PathInfo{Encoded: b, Valid: true}
 	if b == OutPathUnknown {
-		p.Valid, p.Flood = true, false
-		return p
+		return p // Flood stays false: direct route
 	}
-	hashSize := int(b>>6) + 1
-	if hashSize == 4 { // зарезервировано
+	if size := b>>pathHashSizeShift + 1; size >= pathHashSizeMax {
+		p.Valid = false // reserved encoding
 		return p
+	} else {
+		p.Flood = true
+		p.HashSize = int(size)
+		p.HashCount = int(b & pathHashCountMask)
 	}
-	p.Valid = true
-	p.Flood = true
-	p.HashSize = hashSize
-	p.HashCount = int(b & 63)
 	return p
 }
 
-// decodePathBytes разбирает байт path_len вместе с самими хэшами (для rx_log).
-// Возвращает также число потреблённых байт маршрута.
+// decodePathBytes decodes a path_len byte together with the hop hashes that
+// follow it, and reports how many bytes the path consumed.
 func decodePathBytes(b byte, raw []byte) (PathInfo, int) {
 	p := decodePathLenByte(b)
 	if !p.Flood {
 		return p, 0
 	}
-	n := p.HashCount * p.HashSize
-	if n > len(raw) {
-		n = len(raw)
-	}
+	n := min(p.HashCount*p.HashSize, len(raw))
 	p.Bytes = append([]byte(nil), raw[:n]...)
 	for i := 0; i+p.HashSize <= len(p.Bytes); i += p.HashSize {
 		p.Hops = append(p.Hops, hex.EncodeToString(p.Bytes[i:i+p.HashSize]))
@@ -249,7 +109,7 @@ func decodePathBytes(b byte, raw []byte) (PathInfo, int) {
 	return p, n
 }
 
-// RawPacket — разобранный сырой пакет из rx_log.
+// RawPacket is a packet decoded from an rx_log push.
 type RawPacket struct {
 	Header         byte
 	RouteType      uint8
@@ -262,53 +122,181 @@ type RawPacket struct {
 	Payload        []byte
 }
 
-// IsFlood сообщает, был ли пакет широковещательным.
+// IsFlood reports whether the packet used a flood route.
 func (p *RawPacket) IsFlood() bool {
 	return p.RouteType == routeFlood || p.RouteType == routeTransportFlood
 }
 
-// parseRawPacket разбирает wire-формат пакета (Packet::writeTo).
+func routeHasTransportCodes(rt uint8) bool {
+	return rt == routeTransportFlood || rt == routeTransportDirect
+}
+
+// parseRawPacket decodes the wire format produced by Packet::writeTo.
+// parseRawPacket decodes the wire format produced by Packet::writeTo.
 func parseRawPacket(b []byte) (*RawPacket, bool) {
-	if len(b) < 2 {
+	if len(b) < rawPacketMinLen {
 		return nil, false
 	}
-	p := &RawPacket{Header: b[0]}
-	p.RouteType = b[0] & 0x03
-	p.PayloadType = (b[0] >> 2) & 0x0F
-	p.PayloadVer = (b[0] >> 6) & 0x03
-	i := 1
+	r := newReader(b)
+	p := &RawPacket{Header: r.u8()}
+	p.RouteType = p.Header & routeMask
+	p.PayloadType = (p.Header >> payloadTypeShift) & payloadTypeMask
+	p.PayloadVer = (p.Header >> payloadVerShift) & payloadVerMask
 
-	switch p.RouteType {
-	case routeTransportFlood, routeTransportDirect:
-		if len(b) < i+4 {
+	if routeHasTransportCodes(p.RouteType) {
+		if !r.need(len(p.TransportCodes) * 2) {
 			return nil, false
 		}
 		p.HasTransport = true
-		p.TransportCodes[0] = binary.LittleEndian.Uint16(b[i:])
-		p.TransportCodes[1] = binary.LittleEndian.Uint16(b[i+2:])
-		i += 4
+		p.TransportCodes[0] = r.u16()
+		p.TransportCodes[1] = r.u16()
 	}
 
-	p.PathLenByte = b[i]
-	i++
-	pi, used := decodePathBytes(p.PathLenByte, b[i:])
-	p.Path = pi
-	i += used
-
-	if i > len(b) {
+	p.PathLenByte = r.u8()
+	if !r.ok {
 		return nil, false
 	}
-	p.Payload = append([]byte(nil), b[i:]...)
+	var used int
+	p.Path, used = decodePathBytes(p.PathLenByte, r.rest())
+	r.skip(used)
+	if !r.ok {
+		return nil, false
+	}
+	p.Payload = append([]byte(nil), r.rest()...)
 	return p, true
 }
 
 // ---------------------------------------------------------------------------
-// Кадры
+// Little helpers
+// ---------------------------------------------------------------------------
+
+// reader walks a frame with bounds checking. After any short read ok is false
+// and every accessor returns a zero value, so parsers stay linear.
+type reader struct {
+	b   []byte
+	pos int
+	ok  bool
+}
+
+func newReader(b []byte) reader { return reader{b: b, ok: true} }
+
+func (r *reader) need(n int) bool {
+	if !r.ok || r.pos+n > len(r.b) {
+		r.ok = false
+		return false
+	}
+	return true
+}
+
+func (r *reader) u8() byte {
+	if !r.need(1) {
+		return 0
+	}
+	v := r.b[r.pos]
+	r.pos++
+	return v
+}
+
+func (r *reader) i8() int8 { return int8(r.u8()) }
+
+func (r *reader) u16() uint16 {
+	if !r.need(2) {
+		return 0
+	}
+	v := binary.LittleEndian.Uint16(r.b[r.pos:])
+	r.pos += 2
+	return v
+}
+
+func (r *reader) u32() uint32 {
+	if !r.need(4) {
+		return 0
+	}
+	v := binary.LittleEndian.Uint32(r.b[r.pos:])
+	r.pos += 4
+	return v
+}
+
+func (r *reader) i32() int32 { return int32(r.u32()) }
+
+func (r *reader) take(n int) []byte {
+	if !r.need(n) {
+		return nil
+	}
+	v := r.b[r.pos : r.pos+n]
+	r.pos += n
+	return v
+}
+
+func (r *reader) skip(n int) { _ = r.need(n) }
+
+func (r *reader) rest() []byte {
+	if !r.ok || r.pos >= len(r.b) {
+		return nil
+	}
+	return r.b[r.pos:]
+}
+
+func (r *reader) string(n int) string { return trimNUL(string(r.take(n))) }
+
+// frame builds a command frame from a code and its parts.
+func frame(code byte, parts ...[]byte) []byte {
+	n := 1
+	for _, p := range parts {
+		n += len(p)
+	}
+	buf := make([]byte, 0, n)
+	buf = append(buf, code)
+	for _, p := range parts {
+		buf = append(buf, p...)
+	}
+	return buf
+}
+
+func u32le(v uint32) []byte {
+	b := make([]byte, 4)
+	binary.LittleEndian.PutUint32(b, v)
+	return b
+}
+
+func zeros(n int) []byte { return make([]byte, n) }
+
+func trimNUL(s string) string {
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func checkText(text string) error {
+	if len(text) > MaxTextLen {
+		return fmt.Errorf("%w (got %d)", ErrTextTooLong, len(text))
+	}
+	return nil
+}
+
+func frameError(f []byte) error {
+	code := byte(0)
+	if len(f) > 1 {
+		code = f[1]
+	}
+	name := errCodeName(code)
+	switch code {
+	case errCodeNotFound:
+		return fmt.Errorf("%w: %s", ErrNotFound, name)
+	case errCodeUnsupported:
+		return fmt.Errorf("%w: %s", ErrUnsupported, name)
+	}
+	return fmt.Errorf("meshcore: node returned %s", name)
+}
+
+// ---------------------------------------------------------------------------
+// Framing
 // ---------------------------------------------------------------------------
 
 type frameReader struct{ br *bufio.Reader }
 
-// next читает один кадр, при рассинхронизации ищет следующий '>'.
+// next reads one frame, resynchronising on the next '>' after garbage.
 func (fr *frameReader) next() ([]byte, error) {
 	for {
 		magic, err := fr.br.ReadByte()
@@ -324,7 +312,7 @@ func (fr *frameReader) next() ([]byte, error) {
 		}
 		n := int(binary.LittleEndian.Uint16(lb[:]))
 		if n == 0 || n > maxFrameSize {
-			continue // битая длина — ресинхронизация
+			continue
 		}
 		buf := make([]byte, n)
 		if _, err := io.ReadFull(fr.br, buf); err != nil {
@@ -335,7 +323,7 @@ func (fr *frameReader) next() ([]byte, error) {
 }
 
 func encodeFrame(payload []byte) []byte {
-	buf := make([]byte, 0, 3+len(payload))
+	buf := make([]byte, 0, frameHeaderLen+len(payload))
 	buf = append(buf, frameOutMagic, byte(len(payload)), byte(len(payload)>>8))
 	return append(buf, payload...)
 }
@@ -414,26 +402,4 @@ func errCodeName(c byte) string {
 		return "ILLEGAL_ARG"
 	}
 	return fmt.Sprintf("code=%d", c)
-}
-
-// frameError превращает кадр RESP_CODE_ERR в ошибку.
-func frameError(f []byte) error {
-	code := byte(0)
-	if len(f) > 1 {
-		code = f[1]
-	}
-	switch code {
-	case 2:
-		return fmt.Errorf("%w: %s", ErrNotFound, errCodeName(code))
-	case 1:
-		return fmt.Errorf("%w: %s", ErrUnsupported, errCodeName(code))
-	}
-	return fmt.Errorf("meshcore: узел вернул %s", errCodeName(code))
-}
-
-func checkText(text string) error {
-	if len(text) > MaxTextLen {
-		return fmt.Errorf("%w (получено %d)", ErrTextTooLong, len(text))
-	}
-	return nil
 }

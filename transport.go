@@ -1,34 +1,33 @@
-package meshcore
+package GoMeshcoreLib
 
 import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
-	"time"
 
 	"go.bug.st/serial"
 )
 
-// Transport — байтовый канал до компаньона. И TCP, и serial используют
-// одинаковое обрамление кадров, поэтому различий на уровне протокола нет.
+// Transport is the byte channel to a companion radio. TCP and serial use the
+// same frame delimiters, so the protocol layer is transport agnostic.
 type Transport interface {
 	io.Reader
 	io.Writer
 	io.Closer
 }
 
-// ---------------------------------------------------------------------------
-// TCP / WiFi
-// ---------------------------------------------------------------------------
-
 type tcpTransport struct{ conn net.Conn }
 
-// DialTCP подключается к компаньону с WiFi-интерфейсом.
+// DialTCP connects to a companion exposing a WiFi (TCP) interface.
 func DialTCP(host string, port int) (Transport, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
+	// JoinHostPort quotes IPv6 literals, so both "192.168.1.10" and
+	// "fe80::1" produce a dialable address.
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("meshcore: dial %s:%d: %w", host, port, err)
+		return nil, fmt.Errorf("meshcore: dial %s: %w", addr, err)
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
@@ -40,24 +39,20 @@ func (t *tcpTransport) Read(p []byte) (int, error)  { return t.conn.Read(p) }
 func (t *tcpTransport) Write(p []byte) (int, error) { return t.conn.Write(p) }
 func (t *tcpTransport) Close() error                { return t.conn.Close() }
 
-// ---------------------------------------------------------------------------
-// USB / COM-порт
-// ---------------------------------------------------------------------------
-
 type serialTransport struct {
 	port serial.Port
 	stop chan struct{}
 	once sync.Once
 }
 
-// DialSerial подключается к компаньону по USB (COM-порт). baud <= 0 -> 115200.
+// DialSerial connects to a companion over USB. baud <= 0 selects 115200.
 func DialSerial(name string, baud int) (Transport, error) {
 	if baud <= 0 {
-		baud = 115200
+		baud = defaultBaud
 	}
 	mode := &serial.Mode{
 		BaudRate: baud,
-		DataBits: 8,
+		DataBits: serialDataBits,
 		Parity:   serial.NoParity,
 		StopBits: serial.OneStopBit,
 	}
@@ -65,30 +60,29 @@ func DialSerial(name string, baud int) (Transport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("meshcore: open %s: %w", name, err)
 	}
-	// Таймаут чтения нужен, чтобы Read периодически возвращал управление и
-	// можно было заметить закрытие порта.
-	if err := p.SetReadTimeout(250 * time.Millisecond); err != nil {
+	// A read timeout lets Read return periodically so Close is noticed.
+	if err := p.SetReadTimeout(serialReadTimeout); err != nil {
 		_ = p.Close()
 		return nil, fmt.Errorf("meshcore: set read timeout: %w", err)
 	}
 	return &serialTransport{port: p, stop: make(chan struct{})}, nil
 }
 
-// Read никогда не возвращает (0, nil): таймауты порта проглатываются здесь,
-// иначе bufio.Reader ошибся бы io.ErrNoProgress.
+// Read never returns (0, nil): port timeouts are absorbed here, otherwise
+// bufio.Reader would fail with io.ErrNoProgress.
 func (t *serialTransport) Read(p []byte) (int, error) {
-	for {
+	for i := 0; ; i++ {
 		select {
 		case <-t.stop:
 			return 0, io.EOF
 		default:
 		}
 		n, err := t.port.Read(p)
-		if n > 0 {
+		if n > 0 || err != nil {
 			return n, err
 		}
-		if err != nil {
-			return 0, err
+		if i >= serialReadAttempts {
+			return 0, ErrTimeout
 		}
 	}
 }
